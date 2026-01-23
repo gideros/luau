@@ -32,15 +32,18 @@ struct IrBuilder
     void beginBlock(IrOp block);
 
     void loadAndCheckTag(IrOp loc, uint8_t tag, IrOp fallback);
+    void checkSafeEnv(int pcpos);
 
     // Clones all instructions into the current block
     // Source block that is cloned cannot use values coming in from a predecessor
-    void clone(const IrBlock& source, bool removeCurrentTerminator);
+    void clone_NEW(std::vector<uint32_t> sourceIdxs, bool removeCurrentTerminator);
+    void clone_DEPRECATED(const IrBlock& source, bool removeCurrentTerminator);
 
     IrOp undef();
 
     IrOp constInt(int value);
     IrOp constUint(unsigned value);
+    IrOp constImport(unsigned value);
     IrOp constDouble(double value);
     IrOp constTag(uint8_t value);
     IrOp constAny(IrConst constant, uint64_t asCommonKey);

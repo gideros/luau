@@ -11,7 +11,6 @@
 // clang-format off
 typedef enum
 {
-    
     TM_INDEX,
     TM_NEWINDEX,
     TM_MODE,
@@ -22,7 +21,6 @@ typedef enum
 
     TM_EQ, // last tag method with `fast' access
 
-    
     TM_ADD,
     TM_SUB,
     TM_MUL,
@@ -32,7 +30,6 @@ typedef enum
     TM_POW,
     TM_UNM,
 
-    
     TM_LT,
     TM_LE,
     TM_CONCAT,
@@ -61,7 +58,7 @@ typedef enum
 LUAI_DATA const char* const luaT_typenames[];
 LUAI_DATA const char* const luaT_eventname[];
 
-LUAI_FUNC const TValue* luaT_gettm(Table* events, TMS event, TString* ename);
+LUAI_FUNC const TValue* luaT_gettm(LuaTable* events, TMS event, TString* ename);
 LUAI_FUNC const TValue* luaT_gettmbyobj(lua_State* L, const TValue* o, TMS event);
 
 LUAI_FUNC const TString* luaT_objtypenamestr(lua_State* L, const TValue* o);

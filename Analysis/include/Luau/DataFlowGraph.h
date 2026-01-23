@@ -6,6 +6,7 @@
 #include "Luau/ControlFlow.h"
 #include "Luau/DenseHash.h"
 #include "Luau/Def.h"
+#include "Luau/NotNull.h"
 #include "Luau/Symbol.h"
 #include "Luau/TypedAllocator.h"
 
@@ -37,8 +38,6 @@ struct DataFlowGraph
     DefId getDef(const AstExpr* expr) const;
     // Look up the definition optionally, knowing it may not be present.
     std::optional<DefId> getDefOptional(const AstExpr* expr) const;
-    // Look up for the rvalue def for a compound assignment.
-    std::optional<DefId> getRValueDefForCompoundAssign(const AstExpr* expr) const;
 
     DefId getDef(const AstLocal* local) const;
 
@@ -47,14 +46,16 @@ struct DataFlowGraph
 
     const RefinementKey* getRefinementKey(const AstExpr* expr) const;
 
+    std::optional<Symbol> getSymbolFromDef(const Def* def) const;
+
 private:
-    DataFlowGraph() = default;
+    DataFlowGraph(NotNull<DefArena> defArena, NotNull<RefinementKeyArena> keyArena);
 
     DataFlowGraph(const DataFlowGraph&) = delete;
     DataFlowGraph& operator=(const DataFlowGraph&) = delete;
 
-    DefArena defArena;
-    RefinementKeyArena keyArena;
+    NotNull<DefArena> defArena;
+    NotNull<RefinementKeyArena> keyArena;
 
     DenseHashMap<const AstExpr*, const Def*> astDefs{nullptr};
 
@@ -64,10 +65,7 @@ private:
     // There's no AstStatDeclaration, and it feels useless to introduce it just to enforce an invariant in one place.
     // All keys in this maps are really only statements that ambiently declares a symbol.
     DenseHashMap<const AstStat*, const Def*> declaredDefs{nullptr};
-
-    // Compound assignments are in a weird situation where the local being assigned to is also being used at its
-    // previous type implicitly in an rvalue position. This map provides the previous binding.
-    DenseHashMap<const AstExpr*, const Def*> compoundAssignDefs{nullptr};
+    DenseHashMap<const Def*, Symbol> defToSymbol{nullptr};
 
     DenseHashMap<const AstExpr*, const RefinementKey*> astRefinementKeys{nullptr};
     friend struct DataFlowGraphBuilder;
@@ -84,7 +82,6 @@ struct DfgScope
 
     DfgScope* parent;
     ScopeType scopeType;
-    Location location;
 
     using Bindings = DenseHashMap<Symbol, const Def*>;
     using Props = DenseHashMap<const Def*, std::unordered_map<std::string, const Def*>>;
@@ -96,9 +93,6 @@ struct DfgScope
     std::optional<DefId> lookup(DefId def, const std::string& key) const;
 
     void inherit(const DfgScope* childScope);
-
-    bool canUpdateDefinition(Symbol symbol) const;
-    bool canUpdateDefinition(DefId def, const std::string& key) const;
 };
 
 struct DataFlowResult
@@ -111,49 +105,24 @@ using ScopeStack = std::vector<DfgScope*>;
 
 struct DataFlowGraphBuilder
 {
-    static DataFlowGraph build(AstStatBlock* root, NotNull<struct InternalErrorReporter> handle);
-
-    /**
-     * This method is identical to the build method above, but returns a pair of dfg, scopes as the data flow graph
-     * here is intended to live on the module between runs of typechecking. Before, the DFG only needed to live as
-     * long as the typecheck, but in a world with incremental typechecking, we need the information on the dfg to incrementally
-     * typecheck small fragments of code.
-     * @param block - pointer to the ast to build the dfg for
-     * @param handle - for raising internal errors while building the dfg
-     */
-    static std::pair<std::shared_ptr<DataFlowGraph>, std::vector<std::unique_ptr<DfgScope>>> buildShared(
+    static DataFlowGraph build(
         AstStatBlock* block,
-        NotNull<InternalErrorReporter> handle
+        NotNull<DefArena> defArena,
+        NotNull<RefinementKeyArena> keyArena,
+        NotNull<struct InternalErrorReporter> handle
     );
 
-    /**
-     * Takes a stale graph along with a list of scopes, a small fragment of the ast, and a cursor position
-     * and constructs the DataFlowGraph for just that fragment. This method will fabricate defs in the final
-     * DFG for things that have been referenced and exist in the stale dfg.
-     * For example, the fragment local z = x + y will populate defs for x and y from the stale graph.
-     * @param staleGraph - the old DFG
-     * @param scopes - the old DfgScopes in the graph
-     * @param fragment - the Ast Fragment to re-build the root for
-     * @param cursorPos - the current location of the cursor - used to determine which scope we are currently in
-     * @param handle - for internal compiler errors
-     */
-    static DataFlowGraph updateGraph(
-        const DataFlowGraph& staleGraph,
-        const std::vector<std::unique_ptr<DfgScope>>& scopes,
-        AstStatBlock* fragment,
-        const Position& cursorPos,
-        NotNull<InternalErrorReporter> handle
-    );
+    static DataFlowGraph empty(NotNull<DefArena> defArena, NotNull<RefinementKeyArena> keyArena);
 
 private:
-    DataFlowGraphBuilder() = default;
+    DataFlowGraphBuilder(NotNull<DefArena> defArena, NotNull<RefinementKeyArena> keyArena);
 
     DataFlowGraphBuilder(const DataFlowGraphBuilder&) = delete;
     DataFlowGraphBuilder& operator=(const DataFlowGraphBuilder&) = delete;
 
     DataFlowGraph graph;
-    NotNull<DefArena> defArena{&graph.defArena};
-    NotNull<RefinementKeyArena> keyArena{&graph.keyArena};
+    NotNull<DefArena> defArena;
+    NotNull<RefinementKeyArena> keyArena;
 
     struct InternalErrorReporter* handle = nullptr;
 
@@ -162,8 +131,7 @@ private:
 
     /// A stack of scopes used by the visitor to see where we are.
     ScopeStack scopeStack;
-
-    DfgScope* currentScope();
+    NotNull<DfgScope> currentScope();
 
     struct FunctionCapture
     {
@@ -175,14 +143,14 @@ private:
     DenseHashMap<Symbol, FunctionCapture> captures{Symbol{}};
     void resolveCaptures();
 
-    DfgScope* makeChildScope(Location loc, DfgScope::ScopeType scopeType = DfgScope::Linear);
+    DfgScope* makeChildScope(DfgScope::ScopeType scopeType = DfgScope::Linear);
 
     void join(DfgScope* p, DfgScope* a, DfgScope* b);
     void joinBindings(DfgScope* p, const DfgScope& a, const DfgScope& b);
     void joinProps(DfgScope* p, const DfgScope& a, const DfgScope& b);
 
-    DefId lookup(Symbol symbol);
-    DefId lookup(DefId def, const std::string& key);
+    DefId lookup(Symbol symbol, Location location);
+    DefId lookup(DefId def, const std::string& key, Location location);
 
     ControlFlow visit(AstStatBlock* b);
     ControlFlow visitBlockWithoutChildScope(AstStatBlock* b);
@@ -206,7 +174,7 @@ private:
     ControlFlow visit(AstStatTypeFunction* f);
     ControlFlow visit(AstStatDeclareGlobal* d);
     ControlFlow visit(AstStatDeclareFunction* d);
-    ControlFlow visit(AstStatDeclareClass* d);
+    ControlFlow visit(AstStatDeclareExternType* d);
     ControlFlow visit(AstStatError* error);
 
     DataFlowResult visitExpr(AstExpr* e);
@@ -223,6 +191,7 @@ private:
     DataFlowResult visitExpr(AstExprTypeAssertion* t);
     DataFlowResult visitExpr(AstExprIfElse* i);
     DataFlowResult visitExpr(AstExprInterpString* i);
+    DataFlowResult visitExpr(AstExprInstantiate* i);
     DataFlowResult visitExpr(AstExprError* error);
 
     void visitLValue(AstExpr* e, DefId incomingDef);
@@ -248,8 +217,8 @@ private:
 
     void visitTypeList(AstTypeList l);
 
-    void visitGenerics(AstArray<AstGenericType> g);
-    void visitGenericPacks(AstArray<AstGenericTypePack> g);
+    void visitGenerics(AstArray<AstGenericType*> g);
+    void visitGenericPacks(AstArray<AstGenericTypePack*> g);
 };
 
 } // namespace Luau

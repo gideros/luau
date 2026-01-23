@@ -11,9 +11,7 @@
 #include "Luau/VecDeque.h"
 #include "Luau/VisitType.h"
 
-#include <iostream>
 #include <optional>
-#include <ostream>
 
 namespace Luau
 {
@@ -23,6 +21,11 @@ struct InstanceCollector2 : TypeOnceVisitor
     VecDeque<TypePackId> tps;
     DenseHashSet<TypeId> cyclicInstance{nullptr};
     DenseHashSet<TypeId> instanceArguments{nullptr};
+
+    InstanceCollector2()
+        : TypeOnceVisitor("InstanceCollector2", /* skipBoundTypes */ true)
+    {
+    }
 
     bool visit(TypeId ty, const TypeFunctionInstanceType& it) override
     {
@@ -46,7 +49,7 @@ struct InstanceCollector2 : TypeOnceVisitor
             cyclicInstance.insert(t);
     }
 
-    bool visit(TypeId ty, const ClassType&) override
+    bool visit(TypeId ty, const ExternType&) override
     {
         return false;
     }
@@ -125,7 +128,7 @@ std::optional<TypePackId> TypeFunctionReductionGuesser::guess(TypePackId tp)
         guessedHead.push_back(*guessedType);
     }
 
-    return arena->addTypePack(TypePack{guessedHead, tail});
+    return arena->addTypePack(TypePack{std::move(guessedHead), tail});
 }
 
 TypeFunctionReductionGuessResult TypeFunctionReductionGuesser::guessTypeFunctionReductionForFunctionExpr(
@@ -164,7 +167,7 @@ TypeFunctionReductionGuessResult TypeFunctionReductionGuesser::guessTypeFunction
         if (get<TypeFunctionInstanceType>(guess))
             continue;
 
-        results.push_back({local->name.value, guess});
+        results.emplace_back(local->name.value, guess);
     }
 
     // Submit a guess for return types
@@ -174,7 +177,7 @@ TypeFunctionReductionGuessResult TypeFunctionReductionGuesser::guessTypeFunction
         recommendedAnnotation = builtins->unknownType;
     else
         recommendedAnnotation = follow(*guessedReturnType);
-    if (auto t = get<TypeFunctionInstanceType>(recommendedAnnotation))
+    if (get<TypeFunctionInstanceType>(recommendedAnnotation))
         recommendedAnnotation = builtins->unknownType;
 
     toInfer.clear();
@@ -182,7 +185,7 @@ TypeFunctionReductionGuessResult TypeFunctionReductionGuesser::guessTypeFunction
     functionReducesTo.clear();
     substitutable.clear();
 
-    return TypeFunctionReductionGuessResult{results, recommendedAnnotation};
+    return TypeFunctionReductionGuessResult{std::move(results), recommendedAnnotation};
 }
 
 std::optional<TypeId> TypeFunctionReductionGuesser::guessType(TypeId arg)
@@ -260,14 +263,14 @@ std::optional<TypeId> TypeFunctionReductionGuesser::tryAssignOperandType(TypeId 
 {
     // Because we collect innermost instances first, if we see a type function instance as an operand,
     // We try to check if we guessed a type for it
-    if (auto tfit = get<TypeFunctionInstanceType>(ty))
+    if (get<TypeFunctionInstanceType>(ty))
     {
         if (functionReducesTo.contains(ty))
             return {functionReducesTo[ty]};
     }
 
     // If ty is a generic, we need to check if we inferred a substitution
-    if (auto gt = get<GenericType>(ty))
+    if (get<GenericType>(ty))
     {
         if (substitutable.contains(ty))
             return {substitutable[ty]};
@@ -328,12 +331,12 @@ void TypeFunctionReductionGuesser::inferTypeFunctionSubstitutions(TypeId ty, con
         {
             TypeId arg = follow(instance->typeArguments[i]);
             TypeId inference = follow(result.operandInference[i]);
-            if (auto tfit = get<TypeFunctionInstanceType>(arg))
+            if (get<TypeFunctionInstanceType>(arg))
             {
                 if (!functionReducesTo.contains(arg))
                     functionReducesTo.try_insert(arg, inference);
             }
-            else if (auto gt = get<GenericType>(arg))
+            else if (get<GenericType>(arg))
                 substitutable[arg] = inference;
         }
     }

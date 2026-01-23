@@ -19,7 +19,7 @@ class Variant
     static_assert(std::disjunction_v<std::is_reference<Ts>...> == false, "variant does not allow references as an alternative type");
     static_assert(std::disjunction_v<std::is_array<Ts>...> == false, "variant does not allow arrays as an alternative type");
 
-private:
+public:
     template<typename T>
     static constexpr int getTypeId()
     {
@@ -35,6 +35,7 @@ private:
         return -1;
     }
 
+private:
     template<typename T, typename... Tail>
     struct First
     {
@@ -72,7 +73,7 @@ public:
         table[typeId](&storage, &other.storage);
     }
 
-    Variant(Variant&& other)
+    Variant(Variant&& other) noexcept
     {
         typeId = other.typeId;
         tableMove[typeId](&storage, &other.storage);
@@ -90,7 +91,7 @@ public:
         return *this = static_cast<Variant&&>(copy);
     }
 
-    Variant& operator=(Variant&& other)
+    Variant& operator=(Variant&& other) noexcept
     {
         if (this != &other)
         {
@@ -168,7 +169,7 @@ private:
     static constexpr size_t storageAlign = cmax({alignof(Ts)...});
 
     using FnCopy = void (*)(void*, const void*);
-    using FnMove = void (*)(void*, void*);
+    using FnMove = void (*)(void*, void*) noexcept;
     using FnDtor = void (*)(void*);
     using FnPred = bool (*)(const void*, const void*);
 
@@ -179,7 +180,7 @@ private:
     }
 
     template<typename T>
-    static void fnMove(void* dst, void* src)
+    static void fnMove(void* dst, void* src) noexcept
     {
         // static_cast<T&&> is equivalent to std::move() but faster in Debug
         new (dst) T(static_cast<T&&>(*static_cast<T*>(src)));
@@ -288,6 +289,14 @@ auto visit(Visitor&& vis, Variant<Ts...>& var)
         return res;
     }
 }
+
+template<typename... Ts>
+struct overloaded : Ts...
+{
+    using Ts::operator()...;
+};
+template<typename... Ts>
+overloaded(Ts...) -> overloaded<Ts...>;
 
 template<class>
 inline constexpr bool always_false_v = false;

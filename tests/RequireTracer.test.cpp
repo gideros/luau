@@ -60,7 +60,7 @@ TEST_CASE_FIXTURE(RequireTracerFixture, "trace_local")
         require(m)
     )");
 
-    RequireTraceResult result = traceRequires(&fileResolver, block, "ModuleName");
+    RequireTraceResult result = traceRequires(&fileResolver, block, "ModuleName", {});
     REQUIRE(!result.exprs.empty());
 
     AstStatLocal* loc = block->body.data[0]->as<AstStatLocal>();
@@ -99,7 +99,7 @@ TEST_CASE_FIXTURE(RequireTracerFixture, "trace_transitive_local")
 
     REQUIRE_EQ(3, block->body.size);
 
-    RequireTraceResult result = traceRequires(&fileResolver, block, "ModuleName");
+    RequireTraceResult result = traceRequires(&fileResolver, block, "ModuleName", {});
 
     AstStatLocal* local = block->body.data[1]->as<AstStatLocal>();
     REQUIRE(local);
@@ -116,7 +116,7 @@ TEST_CASE_FIXTURE(RequireTracerFixture, "trace_function_arguments")
     )");
     REQUIRE_EQ(1, block->body.size);
 
-    RequireTraceResult result = traceRequires(&fileResolver, block, "ModuleName");
+    RequireTraceResult result = traceRequires(&fileResolver, block, "ModuleName", {});
 
     AstStatLocal* local = block->body.data[0]->as<AstStatLocal>();
     REQUIRE(local != nullptr);
@@ -138,7 +138,7 @@ TEST_CASE_FIXTURE(RequireTracerFixture, "follow_typeof")
     )");
     REQUIRE_EQ(1, block->body.size);
 
-    RequireTraceResult result = traceRequires(&fileResolver, block, "ModuleName");
+    RequireTraceResult result = traceRequires(&fileResolver, block, "ModuleName", {});
 
     AstStatLocal* local = block->body.data[0]->as<AstStatLocal>();
     REQUIRE(local != nullptr);
@@ -162,6 +162,39 @@ TEST_CASE_FIXTURE(RequireTracerFixture, "follow_typeof")
     CHECK_EQ("workspace/CoolThing", result.exprs[call->args.data[0]].name);
 }
 
+TEST_CASE_FIXTURE(RequireTracerFixture, "follow_typeof_in_return_type")
+{
+    AstStatBlock* block = parse(R"(
+        function foo(): typeof(require(workspace.CoolThing).UsefulObject)
+        end
+    )");
+    REQUIRE_EQ(1, block->body.size);
+
+    RequireTraceResult result = traceRequires(&fileResolver, block, "ModuleName", {});
+
+    AstStatFunction* func = block->body.data[0]->as<AstStatFunction>();
+    REQUIRE(func != nullptr);
+
+    AstTypePack* retAnnotation = func->func->returnAnnotation;
+    REQUIRE(retAnnotation);
+
+    AstTypePackExplicit* tp = retAnnotation->as<AstTypePackExplicit>();
+    REQUIRE(tp);
+    REQUIRE_EQ(tp->typeList.types.size, 1);
+    AstTypeTypeof* typeofAnnotation = tp->typeList.types.data[0]->as<AstTypeTypeof>();
+    REQUIRE(typeofAnnotation != nullptr);
+
+    AstExprIndexName* indexName = typeofAnnotation->expr->as<AstExprIndexName>();
+    REQUIRE(indexName != nullptr);
+    REQUIRE_EQ(indexName->index, "UsefulObject");
+
+    AstExprCall* call = indexName->expr->as<AstExprCall>();
+    REQUIRE(call != nullptr);
+    REQUIRE_EQ(1, call->args.size);
+
+    CHECK_EQ("workspace/CoolThing", result.exprs[call->args.data[0]].name);
+}
+
 TEST_CASE_FIXTURE(RequireTracerFixture, "follow_string_indexexpr")
 {
     AstStatBlock* block = parse(R"(
@@ -170,12 +203,61 @@ TEST_CASE_FIXTURE(RequireTracerFixture, "follow_string_indexexpr")
     )");
     REQUIRE_EQ(2, block->body.size);
 
-    RequireTraceResult result = traceRequires(&fileResolver, block, "ModuleName");
+    RequireTraceResult result = traceRequires(&fileResolver, block, "ModuleName", {});
 
     AstStatLocal* local = block->body.data[0]->as<AstStatLocal>();
     REQUIRE(local != nullptr);
 
     CHECK_EQ("game/Test", result.exprs[local->values.data[0]].name);
+}
+
+TEST_CASE_FIXTURE(RequireTracerFixture, "follow_group")
+{
+    AstStatBlock* block = parse(R"(
+        local R = (((game).Test))
+        require(R)
+    )");
+    REQUIRE_EQ(2, block->body.size);
+
+    RequireTraceResult result = traceRequires(&fileResolver, block, "ModuleName", {});
+
+    AstStatLocal* local = block->body.data[0]->as<AstStatLocal>();
+    REQUIRE(local != nullptr);
+
+    CHECK_EQ("game/Test", result.exprs[local->values.data[0]].name);
+}
+
+TEST_CASE_FIXTURE(RequireTracerFixture, "follow_type_annotation")
+{
+    AstStatBlock* block = parse(R"(
+        local R = game.Test :: (typeof(game.Redirect))
+        require(R)
+    )");
+    REQUIRE_EQ(2, block->body.size);
+
+    RequireTraceResult result = traceRequires(&fileResolver, block, "ModuleName", {});
+
+    AstStatLocal* local = block->body.data[0]->as<AstStatLocal>();
+    REQUIRE(local != nullptr);
+
+    CHECK_EQ("game/Redirect", result.exprs[local->values.data[0]].name);
+}
+
+TEST_CASE_FIXTURE(RequireTracerFixture, "follow_type_annotation_2")
+{
+    AstStatBlock* block = parse(R"(
+        local R = game.Test :: (typeof(game.Redirect))
+        local N = R.Nested
+        require(N)
+    )");
+    REQUIRE_EQ(3, block->body.size);
+
+    RequireTraceResult result = traceRequires(&fileResolver, block, "ModuleName", {});
+
+    AstStatLocal* local = block->body.data[1]->as<AstStatLocal>();
+    REQUIRE(local != nullptr);
+
+    CHECK_EQ("game/Redirect/Nested", result.exprs[local->values.data[0]].name);
 }
 
 TEST_SUITE_END();

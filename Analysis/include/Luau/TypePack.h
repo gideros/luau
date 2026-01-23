@@ -1,11 +1,13 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #pragma once
 
+#include "Luau/Common.h"
+#include "Luau/DenseHash.h"
+#include "Luau/NotNull.h"
+#include "Luau/Polarity.h"
+#include "Luau/TypeFwd.h"
 #include "Luau/Unifiable.h"
 #include "Luau/Variant.h"
-#include "Luau/TypeFwd.h"
-#include "Luau/NotNull.h"
-#include "Luau/Common.h"
 
 #include <optional>
 #include <set>
@@ -26,12 +28,14 @@ struct TypeFunctionInstanceTypePack;
 struct FreeTypePack
 {
     explicit FreeTypePack(TypeLevel level);
-    explicit FreeTypePack(Scope* scope);
+    explicit FreeTypePack(Scope* scope, Polarity polarity = Polarity::Unknown);
     FreeTypePack(Scope* scope, TypeLevel level);
 
     int index;
     TypeLevel level;
     Scope* scope = nullptr;
+
+    Polarity polarity = Polarity::Unknown;
 };
 
 struct GenericTypePack
@@ -40,19 +44,23 @@ struct GenericTypePack
     GenericTypePack();
     explicit GenericTypePack(TypeLevel level);
     explicit GenericTypePack(const Name& name);
-    explicit GenericTypePack(Scope* scope);
+    explicit GenericTypePack(Scope* scope, Polarity polarity = Polarity::Unknown);
     GenericTypePack(TypeLevel level, const Name& name);
     GenericTypePack(Scope* scope, const Name& name);
+    GenericTypePack(Scope* scope, Name name, Polarity polarity);
+    explicit GenericTypePack(Polarity polarity);
 
     int index;
     TypeLevel level;
     Scope* scope = nullptr;
     Name name;
     bool explicitName = false;
+
+    Polarity polarity = Polarity::Unknown;
 };
 
 using BoundTypePack = Unifiable::Bound<TypePackId>;
-using ErrorTypePack = Unifiable::Error;
+using ErrorTypePack = Unifiable::Error<TypePackId>;
 
 using TypePackVariant =
     Unifiable::Variant<TypePackId, FreeTypePack, GenericTypePack, TypePack, VariadicTypePack, BlockedTypePack, TypeFunctionInstanceTypePack>;
@@ -100,9 +108,9 @@ struct TypeFunctionInstanceTypePack
 
 struct TypePackVar
 {
-    explicit TypePackVar(const TypePackVariant& ty);
-    explicit TypePackVar(TypePackVariant&& ty);
-    TypePackVar(TypePackVariant&& ty, bool persistent);
+    explicit TypePackVar(const TypePackVariant& tp);
+    explicit TypePackVar(TypePackVariant&& tp);
+    TypePackVar(TypePackVariant&& tp, bool persistent);
 
     bool operator==(const TypePackVar& rhs) const;
 
@@ -110,7 +118,7 @@ struct TypePackVar
 
     TypePackVar& operator=(const TypePackVar& rhs);
 
-    // Re-assignes the content of the pack, but doesn't change the owning arena and can't make pack persistent.
+    // Re-assigns the content of the pack, but doesn't change the owning arena and can't make pack persistent.
     void reassign(const TypePackVar& rhs)
     {
         ty = rhs.ty;
@@ -169,6 +177,7 @@ struct TypePackIterator
 
 private:
     TypePackId currentTypePack = nullptr;
+    TypePackId tailCycleCheck = nullptr;
     const TypePack* tp = nullptr;
     size_t currentIndex = 0;
 
@@ -179,9 +188,7 @@ TypePackIterator begin(TypePackId tp);
 TypePackIterator begin(TypePackId tp, const TxnLog* log);
 TypePackIterator end(TypePackId tp);
 
-using SeenSet = std::set<std::pair<const void*, const void*>>;
-
-bool areEqual(SeenSet& seen, const TypePackVar& lhs, const TypePackVar& rhs);
+TypePackId getTail(TypePackId tp);
 
 TypePackId follow(TypePackId tp);
 TypePackId follow(TypePackId t, const void* context, TypePackId (*mapper)(const void*, TypePackId));
@@ -223,7 +230,7 @@ bool isEmpty(TypePackId tp);
 std::pair<std::vector<TypeId>, std::optional<TypePackId>> flatten(TypePackId tp);
 std::pair<std::vector<TypeId>, std::optional<TypePackId>> flatten(TypePackId tp, const TxnLog& log);
 
-/// Returs true if the type pack arose from a function that is declared to be variadic.
+/// Returns true if the type pack arose from a function that is declared to be variadic.
 /// Returns *false* for function argument packs that are inferred to be safe to oversaturate!
 bool isVariadic(TypePackId tp);
 bool isVariadic(TypePackId tp, const TxnLog& log);
@@ -246,5 +253,17 @@ LUAU_NOINLINE T* emplaceTypePack(TypePackVar* ty, Args&&... args)
 
 template<>
 LUAU_NOINLINE Unifiable::Bound<TypePackId>* emplaceTypePack<BoundTypePack>(TypePackVar* ty, TypePackId& tyArg);
+
+/*
+ * Takes a slice of a TypePack, starting at sliceIndex, and up to and including the tail. toBeSliced should be already decomposed into head and tail.
+ */
+TypePackId sliceTypePack(
+    size_t sliceIndex,
+    TypePackId toBeSliced,
+    const std::vector<TypeId>& head,
+    std::optional<TypePackId> tail,
+    NotNull<BuiltinTypes> builtinTypes,
+    NotNull<TypeArena> arena
+);
 
 } // namespace Luau

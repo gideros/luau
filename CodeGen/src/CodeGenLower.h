@@ -7,6 +7,7 @@
 #include "Luau/IrBuilder.h"
 #include "Luau/IrDump.h"
 #include "Luau/IrUtils.h"
+#include "Luau/LoweringStats.h"
 #include "Luau/OptimizeConstProp.h"
 #include "Luau/OptimizeDeadStore.h"
 #include "Luau/OptimizeFinalX64.h"
@@ -21,36 +22,17 @@
 #include <algorithm>
 #include <vector>
 
-LUAU_FASTFLAG(DebugCodegenNoOpt)
 LUAU_FASTFLAG(DebugCodegenOptSize)
-LUAU_FASTFLAG(DebugCodegenSkipNumbering)
 LUAU_FASTINT(CodegenHeuristicsInstructionLimit)
 LUAU_FASTINT(CodegenHeuristicsBlockLimit)
 LUAU_FASTINT(CodegenHeuristicsBlockInstructionLimit)
-LUAU_FASTFLAG(LuauNativeAttribute)
+LUAU_FASTFLAG(LuauCodegenBlockSafeEnv)
+LUAU_FASTFLAG(LuauCodegenBetterSccRemoval)
 
 namespace Luau
 {
 namespace CodeGen
 {
-
-inline void gatherFunctions_DEPRECATED(std::vector<Proto*>& results, Proto* proto, unsigned int flags)
-{
-    if (results.size() <= size_t(proto->bytecodeid))
-        results.resize(proto->bytecodeid + 1);
-
-    // Skip protos that we've already compiled in this run: this happens because at -O2, inlined functions get their protos reused
-    if (results[proto->bytecodeid])
-        return;
-
-    // Only compile cold functions if requested
-    if ((proto->flags & LPF_NATIVE_COLD) == 0 || (flags & CodeGen_ColdFunctions) != 0)
-        results[proto->bytecodeid] = proto;
-
-    // Recursively traverse child protos even if we aren't compiling this one
-    for (int i = 0; i < proto->sizep; i++)
-        gatherFunctions_DEPRECATED(results, proto->p[i], flags);
-}
 
 inline void gatherFunctionsHelper(
     std::vector<Proto*>& results,
@@ -82,7 +64,6 @@ inline void gatherFunctionsHelper(
 
 inline void gatherFunctions(std::vector<Proto*>& results, Proto* root, const unsigned int flags, const bool hasNativeFunctions = false)
 {
-    LUAU_ASSERT(FFlag::LuauNativeAttribute);
     gatherFunctionsHelper(results, root, flags, hasNativeFunctions, true);
 }
 
@@ -121,7 +102,7 @@ inline bool lowerImpl(
 
     bool outputEnabled = options.includeAssembly || options.includeIr;
 
-    IrToStringContext ctx{build.text, function.blocks, function.constants, function.cfg};
+    IrToStringContext ctx{build.text, function.blocks, function.constants, function.cfg, function.proto};
 
     // We use this to skip outlined fallback blocks from IR/asm text output
     size_t textSize = build.text.length();
@@ -133,6 +114,7 @@ inline bool lowerImpl(
 
     // Make sure entry block is first
     CODEGEN_ASSERT(sortedBlocks[0] == 0);
+    CODEGEN_ASSERT(function.entryBlock == 0);
 
     for (size_t i = 0; i < sortedBlocks.size(); ++i)
     {
@@ -144,6 +126,7 @@ inline bool lowerImpl(
 
         CODEGEN_ASSERT(block.start != ~0u);
         CODEGEN_ASSERT(block.finish != ~0u);
+        CODEGEN_ASSERT(!seenFallback || block.kind == IrBlockKind::Fallback);
 
         // If we want to skip fallback code IR/asm, we'll record when those blocks start once we see them
         if (block.kind == IrBlockKind::Fallback && !seenFallback)
@@ -177,6 +160,21 @@ inline bool lowerImpl(
         // To make sure the register and spill state is correct when blocks are lowered, we check that sorted block order matches the expected one
         if (block.expectedNextBlock != ~0u)
             CODEGEN_ASSERT(function.getBlockIndex(nextBlock) == block.expectedNextBlock);
+
+        // Block might establish a safe environment right at the start
+        if (FFlag::LuauCodegenBlockSafeEnv && (block.flags & kBlockFlagSafeEnvCheck) != 0)
+        {
+            if (options.includeIr)
+            {
+                if (options.includeIrPrefix == IncludeIrPrefix::Yes)
+                    build.logAppend("# ");
+
+                build.logAppend("  implicit CHECK_SAFE_ENV exit(%u)\n", block.startpc);
+            }
+
+            CODEGEN_ASSERT(block.startpc != kBlockNoStartPc);
+            lowering.checkSafeEnv(IrOp{IrOpKind::VmExit, block.startpc}, nextBlock);
+        }
 
         for (uint32_t index = block.start; index <= block.finish; index++)
         {
@@ -318,6 +316,8 @@ inline bool lowerFunction(
     CodeGenCompilationResult& codeGenCompilationResult
 )
 {
+    ir.function.stats = stats;
+
     killUnusedBlocks(ir.function);
 
     unsigned preOptBlockCount = 0;
@@ -352,34 +352,35 @@ inline bool lowerFunction(
 
     computeCfgInfo(ir.function);
 
-    if (!FFlag::DebugCodegenNoOpt)
+    constPropInBlockChains(ir);
+
+    if (!FFlag::DebugCodegenOptSize)
     {
-        bool useValueNumbering = !FFlag::DebugCodegenSkipNumbering;
+        double startTime = 0.0;
+        unsigned constPropInstructionCount = 0;
 
-        constPropInBlockChains(ir, useValueNumbering);
-
-        if (!FFlag::DebugCodegenOptSize)
+        if (stats)
         {
-            double startTime = 0.0;
-            unsigned constPropInstructionCount = 0;
-
-            if (stats)
-            {
-                constPropInstructionCount = getInstructionCount(ir.function.instructions, IrCmd::SUBSTITUTE);
-                startTime = lua_clock();
-            }
-
-            createLinearBlocks(ir, useValueNumbering);
-
-            if (stats)
-            {
-                stats->blockLinearizationStats.timeSeconds += lua_clock() - startTime;
-                constPropInstructionCount = getInstructionCount(ir.function.instructions, IrCmd::SUBSTITUTE) - constPropInstructionCount;
-                stats->blockLinearizationStats.constPropInstructionCount += constPropInstructionCount;
-            }
+            constPropInstructionCount = getInstructionCount(ir.function.instructions, IrCmd::SUBSTITUTE);
+            startTime = lua_clock();
         }
 
-        markDeadStoresInBlockChains(ir);
+        createLinearBlocks(ir);
+
+        if (stats)
+        {
+            stats->blockLinearizationStats.timeSeconds += lua_clock() - startTime;
+            constPropInstructionCount = getInstructionCount(ir.function.instructions, IrCmd::SUBSTITUTE) - constPropInstructionCount;
+            stats->blockLinearizationStats.constPropInstructionCount += constPropInstructionCount;
+        }
+    }
+
+    markDeadStoresInBlockChains(ir);
+
+    if (FFlag::LuauCodegenBetterSccRemoval)
+    {
+        // Recompute the CFG predecessors/successors to match block uses after optimizations
+        computeCfgBlockEdges(ir.function);
     }
 
     std::vector<uint32_t> sortedBlocks = getSortedBlockOrder(ir.function);

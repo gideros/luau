@@ -2,8 +2,12 @@
 #include "BuiltinFolding.h"
 
 #include "Luau/Bytecode.h"
+#include "Luau/Lexer.h"
 
+#include <array>
 #include <math.h>
+
+LUAU_FASTFLAGVARIABLE(LuauCompileStringCharSubFold)
 
 namespace Luau
 {
@@ -12,6 +16,8 @@ namespace Compile
 
 const double kPi = 3.14159265358979323846;
 const double kRadDeg = kPi / 180.0;
+
+constexpr size_t kStringCharFoldLimit = 128;
 
 static Constant cvar()
 {
@@ -50,6 +56,14 @@ static Constant cstring(const char* v)
     return res;
 }
 
+static Constant cstring(const char* v, size_t len)
+{
+    Constant res = {Constant::Type_String};
+    res.stringLength = unsigned(len);
+    res.valueString = v;
+    return res;
+}
+
 static Constant ctype(const Constant& c)
 {
     LUAU_ASSERT(c.type != Constant::Type_Unknown);
@@ -77,13 +91,40 @@ static Constant ctype(const Constant& c)
     }
 }
 
+static Constant ctypeof(const Constant& c)
+{
+    LUAU_ASSERT(c.type != Constant::Type_Unknown);
+
+    switch (c.type)
+    {
+    case Constant::Type_Nil:
+        return cstring("nil");
+
+    case Constant::Type_Boolean:
+        return cstring("boolean");
+
+    case Constant::Type_Number:
+        return cstring("number");
+
+    case Constant::Type_Vector:
+        return cvar(); // vector can have a custom typeof name at runtime
+
+    case Constant::Type_String:
+        return cstring("string");
+
+    default:
+        LUAU_ASSERT(!"Unsupported constant type");
+        return cvar();
+    }
+}
+
 static uint32_t bit32(double v)
 {
     // convert through signed 64-bit integer to match runtime behavior and gracefully truncate negative integers
     return uint32_t(int64_t(v));
 }
 
-Constant foldBuiltin(int bfid, const Constant* args, size_t count)
+Constant foldBuiltin(AstNameTable& stringTable, int bfid, const Constant* args, size_t count)
 {
     switch (bfid)
     {
@@ -429,6 +470,32 @@ Constant foldBuiltin(int bfid, const Constant* args, size_t count)
         }
         break;
 
+    case LBF_STRING_CHAR:
+        if (FFlag::LuauCompileStringCharSubFold && count < kStringCharFoldLimit)
+        {
+            std::array<char, kStringCharFoldLimit> buf{};
+
+            for (size_t i = 0; i < count; i++)
+            {
+                if (args[i].type != Constant::Type_Number)
+                    return cvar();
+
+                int ch = int(args[i].valueNumber);
+
+                if ((unsigned char)(ch) != ch)
+                    return cvar();
+
+                buf[i] = ch;
+            }
+
+            if (count == 0)
+                return cstring("");
+
+            AstName name = stringTable.getOrAdd(buf.data(), count);
+            return cstring(name.value, count);
+        }
+        break;
+
     case LBF_STRING_LEN:
         if (count == 1 && args[0].type == Constant::Type_String)
             return cnum(double(args[0].stringLength));
@@ -436,7 +503,43 @@ Constant foldBuiltin(int bfid, const Constant* args, size_t count)
 
     case LBF_TYPEOF:
         if (count == 1 && args[0].type != Constant::Type_Unknown)
-            return ctype(args[0]);
+            return ctypeof(args[0]);
+        break;
+
+    case LBF_STRING_SUB:
+        if (FFlag::LuauCompileStringCharSubFold && count >= 2 && args[0].type == Constant::Type_String && args[1].type == Constant::Type_Number)
+        {
+            if (count >= 3 && args[2].type != Constant::Type_Number)
+                return cvar();
+
+            const char* str = args[0].valueString;
+            unsigned len = args[0].stringLength;
+
+            int start = int(args[1].valueNumber);
+            int end = count >= 3 ? int(args[2].valueNumber) : int(len);
+
+            // Relative string position: negative means back from end
+            if (start < 0)
+                start += int(len) + 1;
+            if (end < 0)
+                end += int(len) + 1;
+
+            // If end is before the start of the string, substring is empty
+            if (end < 1)
+                return cstring("");
+
+            // Start clamped to the start of the string, end is clamped to the end
+            start = start < 1 ? 1 : start;
+            end = end > int(len) ? int(len) : end;
+
+            if (start <= end)
+            {
+                AstName name = stringTable.getOrAdd(str + (start - 1), end - start + 1);
+                return cstring(name.value, end - start + 1);
+            }
+
+            return cstring("");
+        }
         break;
 
     case LBF_MATH_CLAMP:
@@ -474,11 +577,50 @@ Constant foldBuiltin(int bfid, const Constant* args, size_t count)
         if (count >= 2 && args[0].type == Constant::Type_Number && args[1].type == Constant::Type_Number)
         {
             if (count == 2)
-                return cvector(args[0].valueNumber, args[1].valueNumber, 0, 0);
+                return cvector(args[0].valueNumber, args[1].valueNumber, 0.0, 0.0);
             else if (count == 3 && args[2].type == Constant::Type_Number)
-                return cvector(args[0].valueNumber, args[1].valueNumber, args[2].valueNumber, 0);
+                return cvector(args[0].valueNumber, args[1].valueNumber, args[2].valueNumber, 0.0);
             else if (count == 4 && args[2].type == Constant::Type_Number && args[3].type == Constant::Type_Number)
                 return cvector(args[0].valueNumber, args[1].valueNumber, args[2].valueNumber, args[3].valueNumber);
+        }
+        break;
+
+    case LBF_MATH_LERP:
+        if (count == 3 && args[0].type == Constant::Type_Number && args[1].type == Constant::Type_Number && args[2].type == Constant::Type_Number)
+        {
+            double a = args[0].valueNumber;
+            double b = args[1].valueNumber;
+            double t = args[2].valueNumber;
+
+            double v = (t == 1.0) ? b : a + (b - a) * t;
+            return cnum(v);
+        }
+        break;
+
+    case LBF_MATH_ISNAN:
+        if (count == 1 && args[0].type == Constant::Type_Number)
+        {
+            double x = args[0].valueNumber;
+
+            return cbool(isnan(x));
+        }
+        break;
+
+    case LBF_MATH_ISINF:
+        if (count == 1 && args[0].type == Constant::Type_Number)
+        {
+            double x = args[0].valueNumber;
+
+            return cbool(isinf(x));
+        }
+        break;
+
+    case LBF_MATH_ISFINITE:
+        if (count == 1 && args[0].type == Constant::Type_Number)
+        {
+            double x = args[0].valueNumber;
+
+            return cbool(isfinite(x));
         }
         break;
     }

@@ -3,6 +3,9 @@
 
 #include "Luau/IrUtils.h"
 
+LUAU_FASTFLAGVARIABLE(LuauCodegenChainedSpills)
+LUAU_FASTFLAG(LuauCodegenUpvalueLoadProp2)
+
 namespace Luau
 {
 namespace CodeGen
@@ -14,10 +17,33 @@ IrValueLocationTracking::IrValueLocationTracking(IrFunction& function)
     vmRegValue.fill(kInvalidInstIdx);
 }
 
-void IrValueLocationTracking::setRestoreCallack(void* context, void (*callback)(void* context, IrInst& inst))
+void IrValueLocationTracking::setRestoreCallback(void* context, void (*callback)(void* context, IrInst& inst))
 {
     restoreCallbackCtx = context;
     restoreCallback = callback;
+}
+
+bool IrValueLocationTracking::canBeRematerialized(IrCmd cmd)
+{
+    CODEGEN_ASSERT(FFlag::LuauCodegenChainedSpills);
+
+    return cmd == IrCmd::UINT_TO_NUM || cmd == IrCmd::INT_TO_NUM;
+}
+
+bool IrValueLocationTracking::canRematerializeArguments(IrInst& inst)
+{
+    CODEGEN_ASSERT(FFlag::LuauCodegenChainedSpills);
+
+    if (canBeRematerialized(inst.cmd) && inst.a.kind == IrOpKind::Inst)
+    {
+        IrInst& depInst = function.instOp(inst.a);
+
+        // If this argument is last used in the current instructions, there's no point in preserving it
+        if (depInst.lastUse != function.getInstIndex(inst))
+            return true;
+    }
+
+    return false;
 }
 
 void IrValueLocationTracking::beforeInstLowering(IrInst& inst)
@@ -54,14 +80,15 @@ void IrValueLocationTracking::beforeInstLowering(IrInst& inst)
     case IrCmd::DO_ARITH:
     case IrCmd::DO_LEN:
     case IrCmd::GET_TABLE:
-    case IrCmd::GET_IMPORT:
+    case IrCmd::GET_CACHED_IMPORT:
         invalidateRestoreOp(inst.a, /*skipValueInvalidation*/ false);
         break;
     case IrCmd::CONCAT:
         invalidateRestoreVmRegs(vmRegOp(inst.a), function.uintOp(inst.b));
         break;
     case IrCmd::GET_UPVALUE:
-        invalidateRestoreOp(inst.a, /*skipValueInvalidation*/ false);
+        if (!FFlag::LuauCodegenUpvalueLoadProp2)
+            invalidateRestoreOp(inst.a, /*skipValueInvalidation*/ false);
         break;
     case IrCmd::CALL:
         // Even if result count is limited, all registers starting from function (ra) might be modified
@@ -97,8 +124,10 @@ void IrValueLocationTracking::beforeInstLowering(IrInst& inst)
     case IrCmd::LOAD_FLOAT:
     case IrCmd::LOAD_TVALUE:
     case IrCmd::CMP_ANY:
+    case IrCmd::CMP_TAG:
     case IrCmd::JUMP_IF_TRUTHY:
     case IrCmd::JUMP_IF_FALSY:
+    case IrCmd::JUMP_EQ_TAG:
     case IrCmd::SET_TABLE:
     case IrCmd::SET_UPVALUE:
     case IrCmd::INTERRUPT:
@@ -129,7 +158,6 @@ void IrValueLocationTracking::beforeInstLowering(IrInst& inst)
     case IrCmd::MOD_NUM:
     case IrCmd::MIN_NUM:
     case IrCmd::MAX_NUM:
-    case IrCmd::JUMP_EQ_TAG:
     case IrCmd::JUMP_CMP_NUM:
     case IrCmd::FLOOR_NUM:
     case IrCmd::CEIL_NUM:
@@ -169,9 +197,44 @@ void IrValueLocationTracking::afterInstLowering(IrInst& inst, uint32_t instIdx)
     case IrCmd::STORE_DOUBLE:
     case IrCmd::STORE_INT:
     case IrCmd::STORE_TVALUE:
-        // If this is not the last use of the stored value, we can restore it from this new location
-        if (inst.b.kind == IrOpKind::Inst && function.instOp(inst.b).lastUse != instIdx)
-            recordRestoreOp(inst.b.index, inst.a);
+        if (FFlag::LuauCodegenChainedSpills)
+        {
+            // If this is not the last use of the stored value, we can restore it from this new location
+            // Additionally, even if it's a last use, it might allow its argument to be restored
+            if (inst.b.kind == IrOpKind::Inst)
+            {
+                IrInst& source = function.instOp(inst.b);
+
+                if (source.lastUse != instIdx || canRematerializeArguments(source))
+                    recordRestoreOp(inst.b.index, inst.a);
+            }
+        }
+        else
+        {
+            // If this is not the last use of the stored value, we can restore it from this new location
+            if (inst.b.kind == IrOpKind::Inst && function.instOp(inst.b).lastUse != instIdx)
+                recordRestoreOp(inst.b.index, inst.a);
+        }
+        break;
+    case IrCmd::STORE_SPLIT_TVALUE:
+        if (FFlag::LuauCodegenChainedSpills)
+        {
+            // If this is not the last use of the stored value, we can restore it from this new location
+            // Additionally, even if it's a last use, it might allow its argument to be restored
+            if (inst.c.kind == IrOpKind::Inst)
+            {
+                IrInst& source = function.instOp(inst.c);
+
+                if (source.lastUse != instIdx || canRematerializeArguments(source))
+                    recordRestoreOp(inst.c.index, inst.a);
+            }
+        }
+        else
+        {
+            // If this is not the last use of the stored value, we can restore it from this new location
+            if (inst.c.kind == IrOpKind::Inst && function.instOp(inst.c).lastUse != instIdx)
+                recordRestoreOp(inst.c.index, inst.a);
+        }
         break;
     default:
         break;
@@ -180,22 +243,57 @@ void IrValueLocationTracking::afterInstLowering(IrInst& inst, uint32_t instIdx)
 
 void IrValueLocationTracking::recordRestoreOp(uint32_t instIdx, IrOp location)
 {
-    if (location.kind == IrOpKind::VmReg)
+    if (FFlag::LuauCodegenChainedSpills)
     {
-        int reg = vmRegOp(location);
+        IrInst& inst = function.instructions[instIdx];
 
-        if (reg > maxReg)
-            maxReg = reg;
+        if (location.kind == IrOpKind::VmReg)
+        {
+            int reg = vmRegOp(location);
 
-        // Record location in register memory only if register is not captured
-        if (!function.cfg.captured.regs.test(reg))
-            function.recordRestoreOp(instIdx, location);
+            if (reg > maxReg)
+                maxReg = reg;
 
-        vmRegValue[reg] = instIdx;
+            // Record location in register memory only if register is not captured
+            bool captured = function.cfg.captured.regs.test(reg);
+
+            if (!captured)
+                function.recordRestoreLocation(instIdx, {location, getCmdValueKind(inst.cmd), IrCmd::NOP});
+
+            vmRegValue[reg] = instIdx;
+
+            if (canBeRematerialized(inst.cmd) && inst.a.kind == IrOpKind::Inst)
+            {
+                uint32_t depInstIdx = inst.a.index;
+
+                if (!captured)
+                    function.recordRestoreLocation(depInstIdx, {location, getCmdValueKind(inst.cmd), inst.cmd});
+            }
+        }
+        else if (location.kind == IrOpKind::VmConst)
+        {
+            function.recordRestoreLocation(instIdx, {location, getCmdValueKind(inst.cmd)});
+        }
     }
-    else if (location.kind == IrOpKind::VmConst)
+    else
     {
-        function.recordRestoreOp(instIdx, location);
+        if (location.kind == IrOpKind::VmReg)
+        {
+            int reg = vmRegOp(location);
+
+            if (reg > maxReg)
+                maxReg = reg;
+
+            // Record location in register memory only if register is not captured
+            if (!function.cfg.captured.regs.test(reg))
+                function.recordRestoreOp_DEPRECATED(instIdx, location);
+
+            vmRegValue[reg] = instIdx;
+        }
+        else if (location.kind == IrOpKind::VmConst)
+        {
+            function.recordRestoreOp_DEPRECATED(instIdx, location);
+        }
     }
 }
 
@@ -227,11 +325,39 @@ void IrValueLocationTracking::invalidateRestoreOp(IrOp location, bool skipValueI
             if (inst.needsReload)
                 restoreCallback(restoreCallbackCtx, inst);
 
-            // Instruction loses its memory storage location
-            function.recordRestoreOp(instIdx, IrOp());
+            if (FFlag::LuauCodegenChainedSpills)
+            {
+                // Get the current restore location of the instruction
+                ValueRestoreLocation currRestoreLocation = function.findRestoreLocation(instIdx, /* limitToCurrentBlock */ false);
 
-            // Register loses link with instruction
-            instIdx = kInvalidInstIdx;
+                // If the current location is the one that is being invalidated, we can no longer restore from it
+                if (location == currRestoreLocation.op)
+                    function.recordRestoreLocation(instIdx, {});
+
+                // Register loses link with instruction
+                instIdx = kInvalidInstIdx;
+
+                // Chained instruction special case
+                if (canBeRematerialized(inst.cmd) && inst.a.kind == IrOpKind::Inst)
+                {
+                    uint32_t depInstIdx = inst.a.index;
+                    IrInst& depInst = function.instructions[depInstIdx];
+
+                    if (depInst.needsReload)
+                        restoreCallback(restoreCallbackCtx, depInst);
+
+                    if (location == currRestoreLocation.op)
+                        function.recordRestoreLocation(depInstIdx, {});
+                }
+            }
+            else
+            {
+                // Instruction loses its memory storage location
+                function.recordRestoreOp_DEPRECATED(instIdx, IrOp());
+
+                // Register loses link with instruction
+                instIdx = kInvalidInstIdx;
+            }
         }
     }
     else if (location.kind == IrOpKind::VmConst)

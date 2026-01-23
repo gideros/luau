@@ -7,13 +7,13 @@
 #include <math.h>
 #include <time.h>
 
-LUAU_FASTFLAGVARIABLE(LuauMathMap, false)
-
 #undef PI
 #define PI (3.14159265358979323846)
 #define RADIANS_PER_DEGREE (PI / 180.0)
 
 #define PCG32_INC 105
+
+LUAU_FASTFLAGVARIABLE(LuauMathIsNanInfFinite)
 
 static uint32_t pcg32_random(uint64_t* state)
 {
@@ -418,6 +418,41 @@ static int math_map(lua_State* L)
     return 1;
 }
 
+static int math_lerp(lua_State* L)
+{
+    double a = luaL_checknumber(L, 1);
+    double b = luaL_checknumber(L, 2);
+    double t = luaL_checknumber(L, 3);
+
+    double r = (t == 1.0) ? b : a + (b - a) * t;
+    lua_pushnumber(L, r);
+    return 1;
+}
+
+static int math_isnan(lua_State* L)
+{
+    double x = luaL_checknumber(L, 1);
+
+    lua_pushboolean(L, isnan(x));
+    return 1;
+}
+
+static int math_isinf(lua_State* L)
+{
+    double x = luaL_checknumber(L, 1);
+
+    lua_pushboolean(L, isinf(x));
+    return 1;
+}
+
+static int math_isfinite(lua_State* L)
+{
+    double x = luaL_checknumber(L, 1);
+
+    lua_pushboolean(L, isfinite(x));
+    return 1;
+}
+
 static const luaL_Reg mathlib[] = {
     {"abs", math_abs},
     {"acos", math_acos},
@@ -451,6 +486,8 @@ static const luaL_Reg mathlib[] = {
     {"clamp", math_clamp},
     {"sign", math_sign},
     {"round", math_round},
+    {"map", math_map},
+    {"lerp", math_lerp},
     {NULL, NULL},
 };
 
@@ -466,16 +503,21 @@ int luaopen_math(lua_State* L)
     pcg32_seed(&L->global->rngstate, seed);
 
     luaL_register(L, LUA_MATHLIBNAME, mathlib);
+
+    if (FFlag::LuauMathIsNanInfFinite)
+    {
+        lua_pushcfunction(L, math_isnan, "isnan");
+        lua_setfield(L, -2, "isnan");
+        lua_pushcfunction(L, math_isinf, "isinf");
+        lua_setfield(L, -2, "isinf");
+        lua_pushcfunction(L, math_isfinite, "isfinite");
+        lua_setfield(L, -2, "isfinite");
+    }
+
     lua_pushnumber(L, PI);
     lua_setfield(L, -2, "pi");
     lua_pushnumber(L, HUGE_VAL);
     lua_setfield(L, -2, "huge");
-
-    if (FFlag::LuauMathMap)
-    {
-        lua_pushcfunction(L, math_map, "map");
-        lua_setfield(L, -2, "map");
-    }
 
     return 1;
 }

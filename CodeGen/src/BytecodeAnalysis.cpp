@@ -1,8 +1,7 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/BytecodeAnalysis.h"
 
-#include "Luau/BytecodeUtils.h"
-#include "Luau/CodeGen.h"
+#include "Luau/CodeGenOptions.h"
 #include "Luau/IrData.h"
 #include "Luau/IrUtils.h"
 
@@ -10,6 +9,9 @@
 #include "lstate.h"
 
 #include <algorithm>
+
+LUAU_FASTFLAG(LuauCodegenSetBlockEntryState2)
+LUAU_FASTFLAG(LuauCodegenLinearVecEq)
 
 namespace Luau
 {
@@ -108,6 +110,10 @@ void loadBytecodeTypeInfo(IrFunction& function)
         }
     }
 
+    // Preserve original information
+    if (FFlag::LuauCodegenSetBlockEntryState2)
+        function.bcOriginalTypeInfo = function.bcTypeInfo;
+
     CODEGEN_ASSERT(offset == size_t(proto->sizetypeinfo));
 }
 
@@ -153,7 +159,7 @@ static BytecodeRegTypeInfo* findRegType(BytecodeTypeInfo& info, uint8_t reg, int
     auto b = info.regTypes.begin() + info.regTypeOffsets[reg];
     auto e = info.regTypes.begin() + info.regTypeOffsets[reg + 1];
 
-    // Doen't have info
+    // Doesn't have info
     if (b == e)
         return nullptr;
 
@@ -235,7 +241,7 @@ static uint8_t getBytecodeConstantTag(Proto* proto, unsigned ki)
     return LBC_TYPE_ANY;
 }
 
-static void applyBuiltinCall(int bfid, BytecodeTypes& types)
+static void applyBuiltinCall(LuauBuiltinFunction bfid, BytecodeTypes& types)
 {
     switch (bfid)
     {
@@ -515,6 +521,64 @@ static void applyBuiltinCall(int bfid, BytecodeTypes& types)
         types.a = LBC_TYPE_TABLE;
         types.b = LBC_TYPE_TABLE;
         break;
+    case LBF_VECTOR_MAGNITUDE:
+        types.result = LBC_TYPE_NUMBER;
+        types.a = LBC_TYPE_VECTOR;
+        break;
+    case LBF_VECTOR_NORMALIZE:
+        types.result = LBC_TYPE_VECTOR;
+        types.a = LBC_TYPE_VECTOR;
+        break;
+    case LBF_VECTOR_CROSS:
+        types.result = LBC_TYPE_VECTOR;
+        types.a = LBC_TYPE_VECTOR;
+        types.b = LBC_TYPE_VECTOR;
+        break;
+    case LBF_VECTOR_DOT:
+        types.result = LBC_TYPE_NUMBER;
+        types.a = LBC_TYPE_VECTOR;
+        types.b = LBC_TYPE_VECTOR;
+        break;
+    case LBF_VECTOR_FLOOR:
+    case LBF_VECTOR_CEIL:
+    case LBF_VECTOR_ABS:
+    case LBF_VECTOR_SIGN:
+    case LBF_VECTOR_CLAMP:
+        types.result = LBC_TYPE_VECTOR;
+        types.a = LBC_TYPE_VECTOR;
+        types.b = LBC_TYPE_VECTOR;
+        break;
+    case LBF_VECTOR_MIN:
+    case LBF_VECTOR_MAX:
+        types.result = LBC_TYPE_VECTOR;
+        types.a = LBC_TYPE_VECTOR;
+        types.b = LBC_TYPE_VECTOR;
+        types.c = LBC_TYPE_VECTOR; // We can mark optional arguments
+        break;
+    case LBF_VECTOR_LERP:
+        types.result = LBC_TYPE_VECTOR;
+        types.a = LBC_TYPE_VECTOR;
+        types.b = LBC_TYPE_VECTOR;
+        types.c = LBC_TYPE_NUMBER;
+        break;
+    case LBF_MATH_LERP:
+        types.result = LBC_TYPE_NUMBER;
+        types.a = LBC_TYPE_NUMBER;
+        types.b = LBC_TYPE_NUMBER;
+        types.c = LBC_TYPE_NUMBER;
+        break;
+    case LBF_MATH_ISNAN:
+        types.result = LBC_TYPE_BOOLEAN;
+        types.a = LBC_TYPE_NUMBER;
+        break;
+    case LBF_MATH_ISINF:
+        types.result = LBC_TYPE_BOOLEAN;
+        types.a = LBC_TYPE_NUMBER;
+        break;
+    case LBF_MATH_ISFINITE:
+        types.result = LBC_TYPE_BOOLEAN;
+        types.a = LBC_TYPE_NUMBER;
+        break;
     }
 }
 
@@ -618,7 +682,7 @@ void buildBytecodeBlocks(IrFunction& function, const std::vector<uint8_t>& jumpT
 
         int target = getJumpTarget(*pc, uint32_t(i));
 
-        // Implicit fallthroughs terminate the block and might start a new one
+        // Implicit fallthrough terminate the block and might start a new one
         if (target >= 0 && !isFastCall(op))
         {
             bcBlocks.back().finishpc = i;
@@ -628,7 +692,7 @@ void buildBytecodeBlocks(IrFunction& function, const std::vector<uint8_t>& jumpT
                 bcBlocks.push_back(BytecodeBlock{nexti, -1});
         }
         // Returns just terminate the block
-        else if (op == LOP_RETURN)
+        else if (int(op) == LOP_RETURN)
         {
             bcBlocks.back().finishpc = i;
         }
@@ -673,6 +737,7 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
         for (int i = proto->numparams; i < proto->maxstacksize; ++i)
             regTags[i] = LBC_TYPE_ANY;
 
+        // Namecall instruction has a hook which specifies the result of the next call instruction
         LuauBytecodeType knownNextCallResult = LBC_TYPE_ANY;
 
         for (int i = block.startpc; i <= block.finishpc;)
@@ -691,7 +756,7 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
 
             BytecodeTypes& bcType = function.bcTypes[i];
 
-            switch (op)
+            switch (int(op))
             {
             case LOP_NOP:
                 break;
@@ -755,10 +820,16 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
             }
             case LOP_GETTABLE:
             {
+                int ra = LUAU_INSN_A(*pc);
                 int rb = LUAU_INSN_B(*pc);
                 int rc = LUAU_INSN_C(*pc);
+
+                regTags[ra] = LBC_TYPE_ANY;
+
                 bcType.a = regTags[rb];
                 bcType.b = regTags[rc];
+
+                bcType.result = regTags[ra];
                 break;
             }
             case LOP_SETTABLE:
@@ -809,14 +880,28 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
             case LOP_SETTABLEKS:
             {
                 int rb = LUAU_INSN_B(*pc);
+
                 bcType.a = regTags[rb];
                 bcType.b = LBC_TYPE_STRING;
                 break;
             }
             case LOP_GETTABLEN:
+            {
+                int ra = LUAU_INSN_A(*pc);
+                int rb = LUAU_INSN_B(*pc);
+
+                regTags[ra] = LBC_TYPE_ANY;
+
+                bcType.a = regTags[rb];
+                bcType.b = LBC_TYPE_NUMBER;
+
+                bcType.result = regTags[ra];
+                break;
+            }
             case LOP_SETTABLEN:
             {
                 int rb = LUAU_INSN_B(*pc);
+
                 bcType.a = regTags[rb];
                 bcType.b = LBC_TYPE_NUMBER;
                 break;
@@ -840,7 +925,8 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                     regTags[ra] = LBC_TYPE_NUMBER;
                 else if (bcType.a == LBC_TYPE_VECTOR && bcType.b == LBC_TYPE_VECTOR)
                     regTags[ra] = LBC_TYPE_VECTOR;
-                else if (hostHooks.userdataMetamethodBytecodeType && (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
+                else if (hostHooks.userdataMetamethodBytecodeType &&
+                         (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcodeToHostMetamethod(op));
 
                 bcType.result = regTags[ra];
@@ -873,7 +959,8 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                     if (bcType.b == LBC_TYPE_NUMBER || bcType.b == LBC_TYPE_VECTOR)
                         regTags[ra] = LBC_TYPE_VECTOR;
                 }
-                else if (hostHooks.userdataMetamethodBytecodeType && (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
+                else if (hostHooks.userdataMetamethodBytecodeType &&
+                         (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
                 {
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcodeToHostMetamethod(op));
                 }
@@ -897,7 +984,8 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
 
                 if (bcType.a == LBC_TYPE_NUMBER && bcType.b == LBC_TYPE_NUMBER)
                     regTags[ra] = LBC_TYPE_NUMBER;
-                else if (hostHooks.userdataMetamethodBytecodeType && (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
+                else if (hostHooks.userdataMetamethodBytecodeType &&
+                         (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcodeToHostMetamethod(op));
 
                 bcType.result = regTags[ra];
@@ -922,7 +1010,8 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                     regTags[ra] = LBC_TYPE_NUMBER;
                 else if (bcType.a == LBC_TYPE_VECTOR && bcType.b == LBC_TYPE_VECTOR)
                     regTags[ra] = LBC_TYPE_VECTOR;
-                else if (hostHooks.userdataMetamethodBytecodeType && (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
+                else if (hostHooks.userdataMetamethodBytecodeType &&
+                         (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcodeToHostMetamethod(op));
 
                 bcType.result = regTags[ra];
@@ -955,7 +1044,8 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                     if (bcType.b == LBC_TYPE_NUMBER || bcType.b == LBC_TYPE_VECTOR)
                         regTags[ra] = LBC_TYPE_VECTOR;
                 }
-                else if (hostHooks.userdataMetamethodBytecodeType && (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
+                else if (hostHooks.userdataMetamethodBytecodeType &&
+                         (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
                 {
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcodeToHostMetamethod(op));
                 }
@@ -979,7 +1069,8 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
 
                 if (bcType.a == LBC_TYPE_NUMBER && bcType.b == LBC_TYPE_NUMBER)
                     regTags[ra] = LBC_TYPE_NUMBER;
-                else if (hostHooks.userdataMetamethodBytecodeType && (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
+                else if (hostHooks.userdataMetamethodBytecodeType &&
+                         (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcodeToHostMetamethod(op));
 
                 bcType.result = regTags[ra];
@@ -1000,7 +1091,8 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                     regTags[ra] = LBC_TYPE_NUMBER;
                 else if (bcType.a == LBC_TYPE_VECTOR && bcType.b == LBC_TYPE_VECTOR)
                     regTags[ra] = LBC_TYPE_VECTOR;
-                else if (hostHooks.userdataMetamethodBytecodeType && (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
+                else if (hostHooks.userdataMetamethodBytecodeType &&
+                         (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcodeToHostMetamethod(op));
 
                 bcType.result = regTags[ra];
@@ -1029,7 +1121,8 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                     if (bcType.b == LBC_TYPE_NUMBER || bcType.b == LBC_TYPE_VECTOR)
                         regTags[ra] = LBC_TYPE_VECTOR;
                 }
-                else if (hostHooks.userdataMetamethodBytecodeType && (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
+                else if (hostHooks.userdataMetamethodBytecodeType &&
+                         (isCustomUserdataBytecodeType(bcType.a) || isCustomUserdataBytecodeType(bcType.b)))
                 {
                     regTags[ra] = hostHooks.userdataMetamethodBytecodeType(bcType.a, bcType.b, opcodeToHostMetamethod(op));
                 }
@@ -1096,13 +1189,17 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 CODEGEN_ASSERT(LUAU_INSN_OP(call) == LOP_CALL);
                 int ra = LUAU_INSN_A(call);
 
-                applyBuiltinCall(bfid, bcType);
+                applyBuiltinCall(LuauBuiltinFunction(bfid), bcType);
+
                 regTags[ra + 1] = bcType.a;
                 regTags[ra + 2] = bcType.b;
                 regTags[ra + 3] = bcType.c;
                 regTags[ra] = bcType.result;
 
                 refineRegType(bcTypeInfo, ra, i, bcType.result);
+
+                // Fastcall failure fallback is skipped from result propagation
+                i += skip;
                 break;
             }
             case LOP_FASTCALL1:
@@ -1115,12 +1212,15 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 CODEGEN_ASSERT(LUAU_INSN_OP(call) == LOP_CALL);
                 int ra = LUAU_INSN_A(call);
 
-                applyBuiltinCall(bfid, bcType);
+                applyBuiltinCall(LuauBuiltinFunction(bfid), bcType);
 
                 regTags[LUAU_INSN_B(*pc)] = bcType.a;
                 regTags[ra] = bcType.result;
 
                 refineRegType(bcTypeInfo, ra, i, bcType.result);
+
+                // Fastcall failure fallback is skipped from result propagation
+                i += skip;
                 break;
             }
             case LOP_FASTCALL2:
@@ -1132,13 +1232,16 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 CODEGEN_ASSERT(LUAU_INSN_OP(call) == LOP_CALL);
                 int ra = LUAU_INSN_A(call);
 
-                applyBuiltinCall(bfid, bcType);
+                applyBuiltinCall(LuauBuiltinFunction(bfid), bcType);
 
                 regTags[LUAU_INSN_B(*pc)] = bcType.a;
                 regTags[int(pc[1])] = bcType.b;
                 regTags[ra] = bcType.result;
 
                 refineRegType(bcTypeInfo, ra, i, bcType.result);
+
+                // Fastcall failure fallback is skipped from result propagation
+                i += skip;
                 break;
             }
             case LOP_FASTCALL3:
@@ -1151,14 +1254,17 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 CODEGEN_ASSERT(LUAU_INSN_OP(call) == LOP_CALL);
                 int ra = LUAU_INSN_A(call);
 
-                applyBuiltinCall(bfid, bcType);
+                applyBuiltinCall(LuauBuiltinFunction(bfid), bcType);
 
                 regTags[LUAU_INSN_B(*pc)] = bcType.a;
-                regTags[aux & 0xff] = bcType.b;
-                regTags[(aux >> 8) & 0xff] = bcType.c;
+                regTags[LUAU_INSN_AUX_A(aux)] = bcType.b;
+                regTags[LUAU_INSN_AUX_B(aux)] = bcType.c;
                 regTags[ra] = bcType.result;
 
                 refineRegType(bcTypeInfo, ra, i, bcType.result);
+
+                // Fastcall failure fallback is skipped from result propagation
+                i += skip;
                 break;
             }
             case LOP_FORNPREP:
@@ -1269,18 +1375,38 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
                 break;
             }
             case LOP_GETGLOBAL:
+            {
+                int ra = LUAU_INSN_A(*pc);
+
+                regTags[ra] = LBC_TYPE_ANY;
+                bcType.result = regTags[ra];
+                break;
+            }
             case LOP_SETGLOBAL:
             case LOP_RETURN:
             case LOP_JUMP:
             case LOP_JUMPBACK:
             case LOP_JUMPIF:
             case LOP_JUMPIFNOT:
+                break;
             case LOP_JUMPIFEQ:
             case LOP_JUMPIFLE:
             case LOP_JUMPIFLT:
             case LOP_JUMPIFNOTEQ:
             case LOP_JUMPIFNOTLE:
             case LOP_JUMPIFNOTLT:
+            {
+                if (FFlag::LuauCodegenLinearVecEq)
+                {
+                    int ra = LUAU_INSN_A(*pc);
+                    int rb = pc[1];
+
+                    bcType.a = regTags[ra];
+                    bcType.b = regTags[rb];
+                }
+
+                break;
+            }
             case LOP_JUMPX:
             case LOP_JUMPXEQKNIL:
             case LOP_JUMPXEQKB:
@@ -1291,12 +1417,45 @@ void analyzeBytecodeTypes(IrFunction& function, const HostIrHooks& hostHooks)
             case LOP_FORGLOOP:
             case LOP_FORGPREP_NEXT:
             case LOP_FORGPREP_INEXT:
+                break;
             case LOP_AND:
-            case LOP_ANDK:
             case LOP_OR:
+            {
+                int ra = LUAU_INSN_A(*pc);
+                int rb = LUAU_INSN_B(*pc);
+                int rc = LUAU_INSN_C(*pc);
+
+                bcType.a = regTags[rb];
+                bcType.b = regTags[rc];
+
+                regTags[ra] = LBC_TYPE_ANY;
+                bcType.result = regTags[ra];
+                break;
+            }
+            case LOP_ANDK:
             case LOP_ORK:
+            {
+                int ra = LUAU_INSN_A(*pc);
+                int rb = LUAU_INSN_B(*pc);
+                int kc = LUAU_INSN_C(*pc);
+
+                bcType.a = regTags[rb];
+                bcType.b = getBytecodeConstantTag(proto, kc);
+
+                regTags[ra] = LBC_TYPE_ANY;
+                bcType.result = regTags[ra];
+                break;
+            }
             case LOP_COVERAGE:
+                break;
             case LOP_GETIMPORT:
+            {
+                int ra = LUAU_INSN_A(*pc);
+
+                regTags[ra] = LBC_TYPE_ANY;
+                bcType.result = regTags[ra];
+                break;
+            }
             case LOP_CAPTURE:
             case LOP_PREPVARARGS:
             case LOP_GETVARARGS:

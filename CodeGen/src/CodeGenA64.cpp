@@ -12,6 +12,8 @@
 
 #include "lstate.h"
 
+LUAU_DYNAMIC_FASTFLAG(AddReturnExectargetCheck)
+
 namespace Luau
 {
 namespace CodeGen
@@ -83,7 +85,7 @@ static void emitInterrupt(AssemblyBuilderA64& build)
     // note: recomputing this avoids having to stash x0
     build.ldr(x1, mem(rState, offsetof(lua_State, ci)));
     build.ldr(x0, mem(x1, offsetof(CallInfo, savedpc)));
-    build.sub(x0, x0, sizeof(Instruction));
+    build.sub(x0, x0, uint16_t(sizeof(Instruction)));
     build.str(x0, mem(x1, offsetof(CallInfo, savedpc)));
 
     emitExit(build, /* continueInVm */ false);
@@ -115,7 +117,7 @@ static void emitContinueCall(AssemblyBuilderA64& build, ModuleHelpers& helpers)
 
     build.mov(rClosure, x0);
 
-    CODEGEN_ASSERT(offsetof(Proto, code) == offsetof(Proto, k) + 8);
+    static_assert(offsetof(Proto, code) == offsetof(Proto, k) + sizeof(Proto::k));
     build.ldp(rConstants, rCode, mem(x1, offsetof(Proto, k))); // proto->k, proto->code
 
     build.br(x2);
@@ -143,14 +145,14 @@ void emitReturn(AssemblyBuilderA64& build, ModuleHelpers& helpers)
 
     Label repeatNilLoop = build.setLabel();
     build.str(w4, mem(x1, offsetof(TValue, tt)));
-    build.add(x1, x1, sizeof(TValue));
-    build.sub(w2, w2, 1);
+    build.add(x1, x1, uint16_t(sizeof(TValue)));
+    build.sub(w2, w2, uint16_t(1));
     build.cbnz(w2, repeatNilLoop);
 
     build.setLabel(skipResultCopy);
 
     // x2 = cip = ci - 1
-    build.sub(x2, x0, sizeof(CallInfo));
+    build.sub(x2, x0, uint16_t(sizeof(CallInfo)));
 
     // res = cip->top when nresults >= 0
     Label skipFixedRetTop;
@@ -167,11 +169,11 @@ void emitReturn(AssemblyBuilderA64& build, ModuleHelpers& helpers)
 
     // Unlikely, but this might be the last return from VM
     build.ldr(w4, mem(x0, offsetof(CallInfo, flags)));
-    build.tbnz(w4, countrz(LUA_CALLINFO_RETURN), helpers.exitNoContinueVm);
+    build.tbnz(w4, countrz(uint32_t(LUA_CALLINFO_RETURN)), helpers.exitNoContinueVm);
 
     // Continue in interpreter if function has no native data
     build.ldr(w4, mem(x2, offsetof(CallInfo, flags)));
-    build.tbz(w4, countrz(LUA_CALLINFO_NATIVE), helpers.exitContinueVm);
+    build.tbz(w4, countrz(uint32_t(LUA_CALLINFO_NATIVE)), helpers.exitContinueVm);
 
     // Need to update state of the current function before we jump away
     build.ldr(rClosure, mem(x2, offsetof(CallInfo, func)));
@@ -179,7 +181,15 @@ void emitReturn(AssemblyBuilderA64& build, ModuleHelpers& helpers)
 
     build.ldr(x1, mem(rClosure, offsetof(Closure, l.p))); // cl->l.p aka proto
 
-    CODEGEN_ASSERT(offsetof(Proto, code) == offsetof(Proto, k) + 8);
+    if (DFFlag::AddReturnExectargetCheck)
+    {
+        // Get new instruction location
+        static_assert(offsetof(Proto, exectarget) == offsetof(Proto, execdata) + sizeof(Proto::execdata));
+        build.ldp(x3, x4, mem(x1, offsetof(Proto, execdata)));
+        build.cbz(x4, helpers.exitContinueVmClearNativeFlag);
+    }
+
+    static_assert(offsetof(Proto, code) == offsetof(Proto, k) + sizeof(Proto::k));
     build.ldp(rConstants, rCode, mem(x1, offsetof(Proto, k))); // proto->k, proto->code
 
     // Get instruction index from instruction pointer
@@ -188,9 +198,12 @@ void emitReturn(AssemblyBuilderA64& build, ModuleHelpers& helpers)
     build.ldr(x2, mem(x2, offsetof(CallInfo, savedpc))); // cip->savedpc
     build.sub(x2, x2, rCode);
 
-    // Get new instruction location and jump to it
-    CODEGEN_ASSERT(offsetof(Proto, exectarget) == offsetof(Proto, execdata) + 8);
-    build.ldp(x3, x4, mem(x1, offsetof(Proto, execdata)));
+    if (!DFFlag::AddReturnExectargetCheck)
+    {
+        // Get new instruction location and jump to it
+        static_assert(offsetof(Proto, exectarget) == offsetof(Proto, execdata) + sizeof(Proto::execdata));
+        build.ldp(x3, x4, mem(x1, offsetof(Proto, execdata)));
+    }
     build.ldr(w2, mem(x3, x2));
     build.add(x4, x4, x2);
     build.br(x4);
@@ -205,7 +218,7 @@ static EntryLocations buildEntryFunction(AssemblyBuilderA64& build, UnwindBuilde
     locations.start = build.setLabel();
 
     // prologue
-    build.sub(sp, sp, kStackSize);
+    build.sub(sp, sp, uint16_t(kStackSize));
     build.stp(x29, x30, mem(sp)); // fp, lr
 
     // stash non-volatile registers used for execution environment
@@ -227,7 +240,7 @@ static EntryLocations buildEntryFunction(AssemblyBuilderA64& build, UnwindBuilde
 
     build.ldr(rBase, mem(x0, offsetof(lua_State, base))); // L->base
 
-    CODEGEN_ASSERT(offsetof(Proto, code) == offsetof(Proto, k) + 8);
+    static_assert(offsetof(Proto, code) == offsetof(Proto, k) + sizeof(Proto::k));
     build.ldp(rConstants, rCode, mem(x1, offsetof(Proto, k))); // proto->k, proto->code
 
     build.ldr(x9, mem(x0, offsetof(lua_State, ci)));          // L->ci
@@ -246,7 +259,7 @@ static EntryLocations buildEntryFunction(AssemblyBuilderA64& build, UnwindBuilde
     build.ldp(x21, x22, mem(sp, 32));
     build.ldp(x19, x20, mem(sp, 16));
     build.ldp(x29, x30, mem(sp)); // fp, lr
-    build.add(sp, sp, kStackSize);
+    build.add(sp, sp, uint16_t(kStackSize));
 
     build.ret();
 
@@ -284,11 +297,10 @@ bool initHeaderFunctions(BaseCodeGenContext& codeGenContext)
             codeStart
         ))
     {
-        CODEGEN_ASSERT(!"Failed to create entry function");
         return false;
     }
 
-    // Set the offset at the begining so that functions in new blocks will not overlay the locations
+    // Set the offset at the beginning so that functions in new blocks will not overlay the locations
     // specified by the unwind information of the entry function
     unwind.setBeginOffset(build.getLabelOffset(entryLocations.prologueEnd));
 

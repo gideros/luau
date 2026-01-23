@@ -34,7 +34,7 @@ struct UnifierCounters
 
 struct UnifierSharedState
 {
-    UnifierSharedState(InternalErrorReporter* iceHandler)
+    explicit UnifierSharedState(InternalErrorReporter* iceHandler)
         : iceHandler(iceHandler)
     {
     }
@@ -49,6 +49,26 @@ struct UnifierSharedState
     DenseHashSet<TypePackId> tempSeenTp{nullptr};
 
     UnifierCounters counters;
+
+    bool reentrantTypeReduction = false;
+};
+
+struct TypeReductionReentrancyGuard final
+{
+    explicit TypeReductionReentrancyGuard(NotNull<UnifierSharedState> sharedState)
+        : sharedState{sharedState}
+    {
+        sharedState->reentrantTypeReduction = true;
+    }
+    ~TypeReductionReentrancyGuard()
+    {
+        sharedState->reentrantTypeReduction = false;
+    }
+    TypeReductionReentrancyGuard(const TypeReductionReentrancyGuard&) = delete;
+    TypeReductionReentrancyGuard(TypeReductionReentrancyGuard&&) = delete;
+
+private:
+    NotNull<UnifierSharedState> sharedState;
 };
 
 } // namespace Luau

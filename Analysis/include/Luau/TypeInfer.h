@@ -90,11 +90,11 @@ struct TypeChecker
     ControlFlow check(const ScopePtr& scope, TypeId ty, const ScopePtr& funScope, const AstStatLocalFunction& function);
     ControlFlow check(const ScopePtr& scope, const AstStatTypeAlias& typealias);
     ControlFlow check(const ScopePtr& scope, const AstStatTypeFunction& typefunction);
-    ControlFlow check(const ScopePtr& scope, const AstStatDeclareClass& declaredClass);
+    ControlFlow check(const ScopePtr& scope, const AstStatDeclareExternType& declaredExternType);
     ControlFlow check(const ScopePtr& scope, const AstStatDeclareFunction& declaredFunction);
 
     void prototype(const ScopePtr& scope, const AstStatTypeAlias& typealias, int subLevel = 0);
-    void prototype(const ScopePtr& scope, const AstStatDeclareClass& declaredClass);
+    void prototype(const ScopePtr& scope, const AstStatDeclareExternType& declaredExternType);
 
     ControlFlow checkBlock(const ScopePtr& scope, const AstStatBlock& statement);
     ControlFlow checkBlockWithoutRecursionCheck(const ScopePtr& scope, const AstStatBlock& statement);
@@ -134,6 +134,7 @@ struct TypeChecker
     WithPredicate<TypeId> checkExpr(const ScopePtr& scope, const AstExprError& expr);
     WithPredicate<TypeId> checkExpr(const ScopePtr& scope, const AstExprIfElse& expr, std::optional<TypeId> expectedType = std::nullopt);
     WithPredicate<TypeId> checkExpr(const ScopePtr& scope, const AstExprInterpString& expr);
+    WithPredicate<TypeId> checkExpr(const ScopePtr& scope, const AstExprInstantiate& expr);
 
     TypeId checkExprTable(
         const ScopePtr& scope,
@@ -225,6 +226,14 @@ struct TypeChecker
         bool substituteFreeForNil = false,
         const std::vector<bool>& lhsAnnotations = {},
         const std::vector<std::optional<TypeId>>& expectedTypes = {}
+    );
+
+    TypeId instantiateTypeParameters(
+        const ScopePtr& scope,
+        TypeId baseType,
+        const AstArray<AstTypeOrPack>& explicitTypes,
+        const AstExpr* functionExpr,
+        const Location& location
     );
 
     static std::optional<AstExpr*> matchRequire(const AstExprCall& call);
@@ -326,7 +335,7 @@ public:
     void merge(RefinementMap& l, const RefinementMap& r);
 
     // Produce an "emergency backup type" for recovery from type errors.
-    // This comes in two flavours, depening on whether or not we can make a good guess
+    // This comes in two flavours, depending on whether or not we can make a good guess
     // for an error recovery type.
     TypeId errorRecoveryType(TypeId guess);
     TypePackId errorRecoveryTypePack(TypePackId guess);
@@ -399,8 +408,8 @@ private:
         const ScopePtr& scope,
         std::optional<TypeLevel> levelOpt,
         const AstNode& node,
-        const AstArray<AstGenericType>& genericNames,
-        const AstArray<AstGenericTypePack>& genericPackNames,
+        const AstArray<AstGenericType*>& genericNames,
+        const AstArray<AstGenericTypePack*>& genericPackNames,
         bool useCache = false
     );
 
@@ -486,7 +495,7 @@ private:
     /**
      * A set of incorrect class definitions which is used to avoid a second-pass analysis.
      */
-    DenseHashSet<const AstStatDeclareClass*> incorrectClassDefinitions{nullptr};
+    DenseHashSet<const AstStatDeclareExternType*> incorrectExternTypeDefinitions{nullptr};
 
     std::vector<std::pair<TypeId, ScopePtr>> deferredQuantification;
 };

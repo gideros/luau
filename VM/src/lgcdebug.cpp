@@ -34,7 +34,7 @@ static void validateref(global_State* g, GCObject* f, TValue* v)
     }
 }
 
-static void validatetable(global_State* g, Table* h)
+static void validatetable(global_State* g, LuaTable* h)
 {
     int sizenode = 1 << h->lsizenode;
 
@@ -293,9 +293,9 @@ static void dumpstring(FILE* f, TString* ts)
     fprintf(f, "\"}");
 }
 
-static void dumptable(FILE* f, Table* h)
+static void dumptable(FILE* f, LuaTable* h)
 {
-    size_t size = sizeof(Table) + (h->node == &luaH_dummynode ? 0 : sizenode(h) * sizeof(LuaNode)) + h->sizearray * sizeof(TValue);
+    size_t size = sizeof(LuaTable) + (h->node == &luaH_dummynode ? 0 : sizenode(h) * sizeof(LuaNode)) + h->sizearray * sizeof(TValue);
 
     fprintf(f, "{\"type\":\"table\",\"cat\":%d,\"size\":%d", h->memcat, int(size));
 
@@ -654,12 +654,12 @@ static void enumedges(EnumContext* ctx, GCObject* from, TValue* data, size_t siz
 
 static void enumstring(EnumContext* ctx, TString* ts)
 {
-    enumnode(ctx, obj2gco(ts), ts->len, NULL);
+    enumnode(ctx, obj2gco(ts), sizestring(ts->len), NULL);
 }
 
-static void enumtable(EnumContext* ctx, Table* h)
+static void enumtable(EnumContext* ctx, LuaTable* h)
 {
-    size_t size = sizeof(Table) + (h->node == &luaH_dummynode ? 0 : sizenode(h) * sizeof(LuaNode)) + h->sizearray * sizeof(TValue);
+    size_t size = sizeof(LuaTable) + (h->node == &luaH_dummynode ? 0 : sizenode(h) * sizeof(LuaNode)) + h->sizearray * sizeof(TValue);
 
     // Provide a name for a special registry table
     enumnode(ctx, obj2gco(h), size, h == hvalue(registry(ctx->L)) ? "registry" : NULL);
@@ -730,9 +730,9 @@ static void enumclosure(EnumContext* ctx, Closure* cl)
         char buf[LUA_IDSIZE];
 
         if (p->source)
-            snprintf(buf, sizeof(buf), "%s:%d %s", p->debugname ? getstr(p->debugname) : "", p->linedefined, getstr(p->source));
+            snprintf(buf, sizeof(buf), "%s:%d %s", p->debugname ? getstr(p->debugname) : "unnamed", p->linedefined, getstr(p->source));
         else
-            snprintf(buf, sizeof(buf), "%s:%d", p->debugname ? getstr(p->debugname) : "", p->linedefined);
+            snprintf(buf, sizeof(buf), "%s:%d", p->debugname ? getstr(p->debugname) : "unnamed", p->linedefined);
 
         enumnode(ctx, obj2gco(cl), sizeLclosure(cl->nupvalues), buf);
     }
@@ -757,7 +757,7 @@ static void enumudata(EnumContext* ctx, Udata* u)
 {
     const char* name = NULL;
 
-    if (Table* h = u->metatable)
+    if (LuaTable* h = u->metatable)
     {
         if (h->node != &luaH_dummynode)
         {
@@ -801,9 +801,9 @@ static void enumthread(EnumContext* ctx, lua_State* th)
         char buf[LUA_IDSIZE];
 
         if (p->source)
-            snprintf(buf, sizeof(buf), "%s:%d %s", p->debugname ? getstr(p->debugname) : "", p->linedefined, getstr(p->source));
+            snprintf(buf, sizeof(buf), "thread at %s:%d %s", p->debugname ? getstr(p->debugname) : "unnamed", p->linedefined, getstr(p->source));
         else
-            snprintf(buf, sizeof(buf), "%s:%d", p->debugname ? getstr(p->debugname) : "", p->linedefined);
+            snprintf(buf, sizeof(buf), "thread at %s:%d", p->debugname ? getstr(p->debugname) : "unnamed", p->linedefined);
 
         enumnode(ctx, obj2gco(th), size, buf);
     }
@@ -836,7 +836,14 @@ static void enumproto(EnumContext* ctx, Proto* p)
         ctx->edge(ctx->context, enumtopointer(obj2gco(p)), p->execdata, "[native]");
     }
 
-    enumnode(ctx, obj2gco(p), size, p->source ? getstr(p->source) : NULL);
+    char buf[LUA_IDSIZE];
+
+    if (p->source)
+        snprintf(buf, sizeof(buf), "proto %s:%d %s", p->debugname ? getstr(p->debugname) : "unnamed", p->linedefined, getstr(p->source));
+    else
+        snprintf(buf, sizeof(buf), "proto %s:%d", p->debugname ? getstr(p->debugname) : "unnamed", p->linedefined);
+
+    enumnode(ctx, obj2gco(p), size, buf);
 
     if (p->sizek)
         enumedges(ctx, obj2gco(p), p->k, p->sizek, "constants");
@@ -937,7 +944,7 @@ static void searchrefs(searchState* f, TValue* data, size_t size)
     }
 }
 
-static const char* gettablemode(global_State* g, Table* h)
+static const char* gettablemode(global_State* g, LuaTable* h)
 {
     const TValue* mode = gfasttm(g, h->metatable, TM_MODE);
 
@@ -947,7 +954,7 @@ static const char* gettablemode(global_State* g, Table* h)
     return NULL;
 }
 
-static void searchtable(searchState* f, Table* h)
+static void searchtable(searchState* f, LuaTable* h)
 {
     int weakkey = 0;
     int weakvalue = 0;

@@ -2,15 +2,16 @@
 
 #pragma once
 
-#include "Luau/Error.h"
-#include "Luau/NotNull.h"
 #include "Luau/Common.h"
-#include "Luau/TypeUtils.h"
+#include "Luau/Error.h"
+#include "Luau/Normalize.h"
+#include "Luau/NotNull.h"
+#include "Luau/Subtyping.h"
 #include "Luau/Type.h"
 #include "Luau/TypeFwd.h"
-#include "Luau/TypeOrPack.h"
-#include "Luau/Normalize.h"
-#include "Luau/Subtyping.h"
+#include "Luau/TypeUtils.h"
+
+LUAU_FASTFLAG(LuauBetterTypeMismatchErrors)
 
 namespace Luau
 {
@@ -37,18 +38,18 @@ struct Reasonings
 
     std::string toString()
     {
+        if (reasons.empty())
+            return "";
+
         // DenseHashSet ordering is entirely undefined, so we want to
         // sort the reasons here to achieve a stable error
         // stringification.
         std::sort(reasons.begin(), reasons.end());
-        std::string allReasons;
-        bool first = true;
+        std::string allReasons = (FFlag::LuauBetterTypeMismatchErrors && reasons.size() < 2) ? "\n" : "\nthis is because ";
         for (const std::string& reason : reasons)
         {
-            if (first)
-                first = false;
-            else
-                allReasons += "\n\t";
+            if (reasons.size() > 1)
+                allReasons += "\n\t * ";
 
             allReasons += reason;
         }
@@ -61,7 +62,7 @@ struct Reasonings
 void check(
     NotNull<BuiltinTypes> builtinTypes,
     NotNull<TypeFunctionRuntime> typeFunctionRuntime,
-    NotNull<UnifierSharedState> sharedState,
+    NotNull<UnifierSharedState> unifierState,
     NotNull<TypeCheckLimits> limits,
     DcrLogger* logger,
     const SourceModule& sourceModule,
@@ -103,6 +104,9 @@ struct TypeChecker2
     Reasonings explainReasonings(TypeId subTy, TypeId superTy, Location location, const SubtypingResult& r);
     Reasonings explainReasonings(TypePackId subTp, TypePackId superTp, Location location, const SubtypingResult& r);
 
+    bool testIsSubtype(TypeId subTy, TypeId superTy, Location location);
+    bool testIsSubtype(TypePackId subTy, TypePackId superTy, Location location);
+
 private:
     static bool allowsNoReturnValues(const TypePackId tp);
     static Location getEndLocation(const AstExprFunction* function);
@@ -112,14 +116,14 @@ private:
     std::optional<StackPusher> pushStack(AstNode* node);
     void checkForInternalTypeFunction(TypeId ty, Location location);
     TypeId checkForTypeFunctionInhabitance(TypeId instance, Location location);
-    TypePackId lookupPack(AstExpr* expr);
+    TypePackId lookupPack(AstExpr* expr) const;
     TypeId lookupType(AstExpr* expr);
     TypeId lookupAnnotation(AstType* annotation);
-    std::optional<TypePackId> lookupPackAnnotation(AstTypePack* annotation);
-    TypeId lookupExpectedType(AstExpr* expr);
-    TypePackId lookupExpectedPack(AstExpr* expr, TypeArena& arena);
+    std::optional<TypePackId> lookupPackAnnotation(AstTypePack* annotation) const;
+    TypeId lookupExpectedType(AstExpr* expr) const;
+    TypePackId lookupExpectedPack(AstExpr* expr, TypeArena& arena) const;
     TypePackId reconstructPack(AstArray<AstExpr*> exprs, TypeArena& arena);
-    Scope* findInnermostScope(Location location);
+    Scope* findInnermostScope(Location location) const;
     void visit(AstStat* stat);
     void visit(AstStatIf* ifStatement);
     void visit(AstStatWhile* whileStatement);
@@ -143,7 +147,7 @@ private:
     void visit(AstTypeList types);
     void visit(AstStatDeclareFunction* stat);
     void visit(AstStatDeclareGlobal* stat);
-    void visit(AstStatDeclareClass* stat);
+    void visit(AstStatDeclareExternType* stat);
     void visit(AstStatError* stat);
     void visit(AstExpr* expr, ValueContext context);
     void visit(AstExprGroup* expr, ValueContext context);
@@ -156,7 +160,7 @@ private:
     void visit(AstExprVarargs* expr);
     void visitCall(AstExprCall* call);
     void visit(AstExprCall* call);
-    std::optional<TypeId> tryStripUnionFromNil(TypeId ty);
+    std::optional<TypeId> tryStripUnionFromNil(TypeId ty) const;
     TypeId stripFromNilAndReport(TypeId ty, const Location& location);
     void visitExprName(AstExpr* expr, Location location, const std::string& propName, ValueContext context, TypeId astIndexExprTy);
     void visit(AstExprIndexName* indexName, ValueContext context);
@@ -169,9 +173,10 @@ private:
     void visit(AstExprTypeAssertion* expr);
     void visit(AstExprIfElse* expr);
     void visit(AstExprInterpString* interpString);
+    void visit(AstExprInstantiate* explicitTypeInstantiation);
     void visit(AstExprError* expr);
     TypeId flattenPack(TypePackId pack);
-    void visitGenerics(AstArray<AstGenericType> generics, AstArray<AstGenericTypePack> genericPacks);
+    void visitGenerics(AstArray<AstGenericType*> generics, AstArray<AstGenericTypePack*> genericPacks);
     void visit(AstType* ty);
     void visit(AstTypeReference* ty);
     void visit(AstTypeTable* table);
@@ -189,8 +194,16 @@ private:
 
     void explainError(TypeId subTy, TypeId superTy, Location location, const SubtypingResult& result);
     void explainError(TypePackId subTy, TypePackId superTy, Location location, const SubtypingResult& result);
-    bool testIsSubtype(TypeId subTy, TypeId superTy, Location location);
-    bool testIsSubtype(TypePackId subTy, TypePackId superTy, Location location);
+
+    bool testLiteralOrAstTypeIsSubtype(AstExpr* expr, TypeId expectedType);
+
+    bool testPotentialLiteralIsSubtype(AstExpr* expr, TypeId expectedType);
+
+    void maybeReportSubtypingError(TypeId subTy, TypeId superTy, const Location& location);
+    // Tests whether subTy is a subtype of superTy in the context of a function iterator for a for-in statement.
+    // Includes some extra logic to help locate errors to the values and variables of the for-in statement.
+    void testIsSubtypeForInStat(TypeId iterFunc, TypeId prospectiveFunc, const AstStatForIn& forInStat);
+
     void reportError(TypeError e);
     void reportErrors(ErrorVec errors);
     PropertyTypes lookupProp(
@@ -213,11 +226,26 @@ private:
         std::vector<TypeError>& errors
     );
 
+    // Avoid duplicate warnings being emitted for the same global variable.
+    DenseHashSet<std::string> warnedGlobals{""};
+
+    void suggestAnnotations(AstExprFunction* expr, TypeId ty);
+
+    void checkTypeInstantiation(AstExpr* baseFunctionExpr, TypeId fnType, const Location& location, const AstArray<AstTypeOrPack>& typeArguments);
+
     void diagnoseMissingTableKey(UnknownProperty* utk, TypeErrorData& data) const;
     bool isErrorSuppressing(Location loc, TypeId ty);
     bool isErrorSuppressing(Location loc1, TypeId ty1, Location loc2, TypeId ty2);
     bool isErrorSuppressing(Location loc, TypePackId tp);
     bool isErrorSuppressing(Location loc1, TypePackId tp1, Location loc2, TypePackId tp2);
+
+    // Returns whether we reported any errors
+    bool reportNonviableOverloadErrors(
+        std::vector<std::pair<TypeId, ErrorVec>> nonviableOverloads,
+        Location callFuncLocation,
+        size_t argHeadSize,
+        Location callLocation
+    );
 };
 
 } // namespace Luau

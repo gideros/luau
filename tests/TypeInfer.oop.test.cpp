@@ -2,6 +2,9 @@
 
 #include "Luau/AstQuery.h"
 #include "Luau/BuiltinDefinitions.h"
+#include "Luau/Common.h"
+#include "Luau/Error.h"
+#include "Luau/Frontend.h"
 #include "Luau/Type.h"
 #include "Luau/VisitType.h"
 
@@ -12,19 +15,29 @@
 
 using namespace Luau;
 
-LUAU_FASTFLAG(LuauSolverV2);
+LUAU_FASTFLAG(LuauHandleFunctionOversaturation)
+LUAU_FASTFLAG(LuauIndexInMetatableSubtyping)
+LUAU_FASTFLAG(LuauPushTypeConstraintLambdas3)
+LUAU_FASTFLAG(LuauSolverV2)
+LUAU_FASTFLAG(LuauTrackFreeInteriorTypePacks)
 
 TEST_SUITE_BEGIN("TypeInferOOP");
 
 TEST_CASE_FIXTURE(Fixture, "dont_suggest_using_colon_rather_than_dot_if_not_defined_with_colon")
 {
-    // CLI-116571 method calls are missing arity checking?
-    ScopedFastFlag sff{FFlag::LuauSolverV2, false};
-
     CheckResult result = check(R"(
         local someTable = {}
 
+        local function abs(x: number)
+            if x < 0 then
+                return -x
+            else
+                return x
+            end
+        end
+
         someTable.Function1 = function(Arg1)
+            abs(Arg1)
         end
 
         someTable.Function1() -- Argument count mismatch
@@ -36,13 +49,20 @@ TEST_CASE_FIXTURE(Fixture, "dont_suggest_using_colon_rather_than_dot_if_not_defi
 
 TEST_CASE_FIXTURE(Fixture, "dont_suggest_using_colon_rather_than_dot_if_it_wont_help_2")
 {
-    // CLI-116571 method calls are missing arity checking?
-    ScopedFastFlag sff{FFlag::LuauSolverV2, false};
-
     CheckResult result = check(R"(
         local someTable = {}
 
+        local function abs(x: number)
+            if x < 0 then
+                return -x
+            else
+                return x
+            end
+        end
+
         someTable.Function2 = function(Arg1, Arg2)
+            abs(Arg1)
+            abs(Arg2)
         end
 
         someTable.Function2() -- Argument count mismatch
@@ -148,6 +168,40 @@ TEST_CASE_FIXTURE(Fixture, "inferring_hundreds_of_self_calls_should_not_suffocat
         CHECK_GE(80, module->internalTypes.types.size());
     else
         CHECK_GE(50, module->internalTypes.types.size());
+}
+
+TEST_CASE_FIXTURE(Fixture, "pass_too_many_arguments")
+{
+    ScopedFastFlag sff[] = {
+        {FFlag::LuauSolverV2, true},
+        {FFlag::LuauPushTypeConstraintLambdas3, true},
+        {FFlag::LuauHandleFunctionOversaturation, true},
+    };
+
+    CheckResult result = check(R"(
+        type T = {
+            method: (T, number) -> number
+        }
+
+        function makeT(): T
+            return {
+                method=function(self, number)
+                    return number * 2
+                end
+            }
+        end
+
+        local a = makeT()
+        a:method(5, 7)
+    )");
+
+    LUAU_CHECK_ERROR_COUNT(1, result);
+
+    const CountMismatch* countMismatch = get<CountMismatch>(result.errors.at(0));
+    REQUIRE_MESSAGE(countMismatch, "Expected CountMismatch but got " << result.errors.at(0));
+
+    CHECK(countMismatch->expected == 2);
+    CHECK(countMismatch->actual == 3);
 }
 
 TEST_CASE_FIXTURE(BuiltinsFixture, "object_constructor_can_refer_to_method_of_self")
@@ -349,7 +403,7 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "augmenting_an_unsealed_table_with_a_metatabl
     if (FFlag::LuauSolverV2)
         CHECK("{ @metatable { number: number }, { method: (unknown) -> string } }" == toString(requireType("B"), {true}));
     else
-        CHECK("{ @metatable { number: number }, { method: <a>(a) -> string } }" == toString(requireType("B"), {true}));
+        CHECK("{ @metatable {| number: number |}, {| method: <a>(a) -> string |} }" == toString(requireType("B"), {true}));
 }
 
 TEST_CASE_FIXTURE(BuiltinsFixture, "react_style_oo")
@@ -419,7 +473,7 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "cycle_between_object_constructor_and_alias")
 
 TEST_CASE_FIXTURE(BuiltinsFixture, "promise_type_error_too_complex" * doctest::timeout(2))
 {
-    frontend.options.retainFullTypeGraphs = false;
+    getFrontend().options.retainFullTypeGraphs = false;
 
     // Used `luau-reduce` tool to extract a minimal reproduction.
     // Credit: https://github.com/evaera/roblox-lua-promise/blob/v4.0.0/lib/init.lua
@@ -537,10 +591,10 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "cross_module_metatable")
         setmetatable(tbl, cls)
     )";
 
-    CheckResult result = frontend.check("game/B");
+    CheckResult result = getFrontend().check("game/B");
     LUAU_REQUIRE_NO_ERRORS(result);
 
-    ModulePtr b = frontend.moduleResolver.getModule("game/B");
+    ModulePtr b = getFrontend().moduleResolver.getModule("game/B");
     REQUIRE(b);
 
     std::optional<Binding> clsBinding = b->getModuleScope()->linearSearchForBinding("tbl");
@@ -549,6 +603,203 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "cross_module_metatable")
     TypeId clsType = clsBinding->typeId;
 
     CHECK("{ @metatable cls, tbl }" == toString(clsType));
+}
+
+// https://luau.org/typecheck#adding-types-for-faux-object-oriented-programs
+TEST_CASE_FIXTURE(BuiltinsFixture, "textbook_class_pattern")
+{
+    if (!FFlag::LuauSolverV2)
+        return;
+
+    CheckResult result = check(R"(
+        local Account = {}
+        Account.__index = Account
+
+        type AccountData = {
+            name: string,
+            balance: number,
+        }
+
+        export type Account = setmetatable<AccountData, typeof(Account)>
+
+        function Account.new(name, balance): Account
+            local self = {}
+            self.name = name
+            self.balance = balance
+
+            return setmetatable(self, Account)
+        end
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "textbook_class_pattern_2")
+{
+    if (!FFlag::LuauSolverV2)
+        return;
+
+    CheckResult result = check(R"(
+        local Account = {}
+        Account.__index = Account
+
+        type AccountData = {
+            name: string,
+            balance: number,
+        }
+
+        export type Account = setmetatable<AccountData, typeof(Account)>
+
+        function Account.new(name, balance): Account
+            local self = {}
+            self.name = name
+            self.balance = balance
+
+            return setmetatable(self, Account)
+        end
+
+        function Account.deposit(self: Account, credit: number)
+            self.balance += credit
+        end
+
+        function Account.withdraw(self: Account, debit: number)
+            self.balance -= debit
+        end
+
+        function Account.hasBalance(self: Account, amount: number): boolean
+            return self.balance >= amount
+        end
+
+        local account = Account.new("Hina", 500)
+
+        if account:hasBalance(123) then -- TypeError: Value of type 'unknown' could be nil
+        end
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "oop_invoke_with_inferred_self_type")
+{
+    ScopedFastFlag _{FFlag::LuauIndexInMetatableSubtyping, true};
+
+    LUAU_REQUIRE_NO_ERRORS(check(R"(
+        local ItemContainer = {}
+        ItemContainer.__index = ItemContainer
+
+        function ItemContainer.new()
+            local self = {}
+            setmetatable(self, ItemContainer)
+            return self
+        end
+
+        function ItemContainer:removeItem(itemId, itemType)
+            self:getItem(itemId, itemType)
+        end
+
+        function ItemContainer:getItem(itemId, itemType): ()
+        end
+
+        local container = ItemContainer.new()
+
+        container:removeItem(0, "magic")
+    )"));
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "oop_invoke_with_inferred_self_and_property")
+{
+    ScopedFastFlag _{FFlag::LuauIndexInMetatableSubtyping, true};
+
+    LUAU_REQUIRE_NO_ERRORS(check(R"(
+        local ItemContainer = {}
+        ItemContainer.__index = ItemContainer
+
+        function ItemContainer.new(name)
+            local self = {name = name}
+            setmetatable(self, ItemContainer)
+            return self
+        end
+
+        function ItemContainer:removeItem(itemId, itemType)
+            print(self.name)
+            self:getItem(itemId, itemType)
+        end
+
+        function ItemContainer:getItem(itemId, itemType): ()
+        end
+
+        local container = ItemContainer.new("library")
+
+        container:removeItem(0, "magic")
+    )"));
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "metatable_field_allows_upcast")
+{
+    ScopedFastFlag sffs[] = {
+        {FFlag::LuauSolverV2, true},
+        {FFlag::LuauIndexInMetatableSubtyping, true},
+    };
+
+    LUAU_REQUIRE_NO_ERRORS(check(R"(
+        local Foobar = {}
+        Foobar.__index = Foobar
+        Foobar.const = 42
+
+        local foobar = setmetatable({}, Foobar)
+
+        local _: { read const: number } = foobar
+    )"));
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "metatable_field_disallows_invalid_upcast")
+{
+    ScopedFastFlag sffs[] = {
+        {FFlag::LuauSolverV2, true},
+        {FFlag::LuauIndexInMetatableSubtyping, true},
+    };
+
+    CheckResult results = check(R"(
+        local Foobar = {}
+        Foobar.__index = Foobar
+        Foobar.const = 42
+
+        local foobar = setmetatable({}, Foobar)
+
+        local _: { const: number } = foobar
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(1, results);
+    auto err = get<TypeMismatch>(results.errors[0]);
+    REQUIRE(err);
+    CHECK_EQ("{ const: number }", toString(err->wantedType));
+    CHECK_EQ("{ @metatable t1, {  } } where t1 = { __index: t1, const: number }", toString(err->givenType, {/* exhaustive */ true}));
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "metatable_field_precedence_for_subtyping")
+{
+    ScopedFastFlag sffs[] = {
+        {FFlag::LuauSolverV2, true},
+        {FFlag::LuauIndexInMetatableSubtyping, true},
+    };
+
+    CheckResult results = check(R"(
+        local function foobar1(_: { read foo: number }) end
+        local function foobar2(_: { read bar: boolean }) end
+        local function foobar3(_: { read foo: string }) end
+
+        local t = { foo = 4 }
+        setmetatable(t, { __index = { foo = "heh", bar = true }})
+        foobar1(t)
+        foobar2(t)
+        foobar3(t)
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(1, results);
+    auto err = get<TypeMismatch>(results.errors[0]);
+    REQUIRE(err);
+    CHECK_EQ("{ read foo: string }", toString(err->wantedType, {/* exhaustive */ true}));
+    CHECK_EQ("{ @metatable { __index: { bar: boolean, foo: string } }, { foo: number } }", toString(err->givenType, { /* exhaustive */ true}));
 }
 
 TEST_SUITE_END();

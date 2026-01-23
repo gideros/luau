@@ -2,22 +2,21 @@
 #include "Luau/Substitution.h"
 
 #include "Luau/Common.h"
-#include "Luau/Clone.h"
 #include "Luau/TxnLog.h"
+#include "Luau/Type.h"
 
 #include <algorithm>
-#include <stdexcept>
 
 LUAU_FASTINTVARIABLE(LuauTarjanChildLimit, 10000)
-LUAU_FASTFLAG(LuauSolverV2);
-LUAU_FASTINTVARIABLE(LuauTarjanPreallocationSize, 256);
+LUAU_FASTFLAG(LuauSolverV2)
+LUAU_FASTINTVARIABLE(LuauTarjanPreallocationSize, 256)
 
 namespace Luau
 {
 
-static TypeId shallowClone(TypeId ty, TypeArena& dest, const TxnLog* log, bool alwaysClone)
+static TypeId shallowClone(TypeId ty, TypeArena& dest, const TxnLog* log)
 {
-    auto go = [ty, &dest, alwaysClone](auto&& a)
+    auto go = [ty, &dest](auto&& a)
     {
         using T = std::decay_t<decltype(a)>;
 
@@ -57,8 +56,17 @@ static TypeId shallowClone(TypeId ty, TypeArena& dest, const TxnLog* log, bool a
         }
         else if constexpr (std::is_same_v<T, ErrorType>)
         {
-            LUAU_ASSERT(ty->persistent);
-            return ty;
+            LUAU_ASSERT(ty->persistent || a.synthetic);
+
+            if (ty->persistent)
+                return ty;
+
+            // While this code intentionally works (and clones) even if `a.synthetic` is `std::nullopt`,
+            // we still assert above because we consider it a bug to have a non-persistent error type
+            // without any associated metadata. We should always use the persistent version in such cases.
+            ErrorType clone = ErrorType{};
+            clone.synthetic = a.synthetic;
+            return dest.addType(clone);
         }
         else if constexpr (std::is_same_v<T, UnknownType>)
         {
@@ -76,15 +84,15 @@ static TypeId shallowClone(TypeId ty, TypeArena& dest, const TxnLog* log, bool a
             return dest.addType(a);
         else if constexpr (std::is_same_v<T, FunctionType>)
         {
-            FunctionType clone = FunctionType{a.level, a.scope, a.argTypes, a.retTypes, a.definition, a.hasSelf};
+            FunctionType clone = FunctionType{a.level, a.argTypes, a.retTypes, a.definition, a.hasSelf};
             clone.generics = a.generics;
             clone.genericPacks = a.genericPacks;
-            clone.magicFunction = a.magicFunction;
-            clone.dcrMagicFunction = a.dcrMagicFunction;
-            clone.dcrMagicRefinement = a.dcrMagicRefinement;
+            clone.magic = a.magic;
             clone.tags = a.tags;
             clone.argNames = a.argNames;
             clone.isCheckedFunction = a.isCheckedFunction;
+            clone.isDeprecatedFunction = a.isDeprecatedFunction;
+            clone.deprecatedInfo = a.deprecatedInfo;
             return dest.addType(std::move(clone));
         }
         else if constexpr (std::is_same_v<T, TableType>)
@@ -118,21 +126,16 @@ static TypeId shallowClone(TypeId ty, TypeArena& dest, const TxnLog* log, bool a
             clone.parts = a.parts;
             return dest.addType(std::move(clone));
         }
-        else if constexpr (std::is_same_v<T, ClassType>)
+        else if constexpr (std::is_same_v<T, ExternType>)
         {
-            if (alwaysClone)
-            {
-                ClassType clone{a.name, a.props, a.parent, a.metatable, a.tags, a.userData, a.definitionModuleName, a.definitionLocation, a.indexer};
-                return dest.addType(std::move(clone));
-            }
-            else
-                return ty;
+            ExternType clone{a.name, a.props, a.parent, a.metatable, a.tags, a.userData, a.definitionModuleName, a.definitionLocation, a.indexer};
+            return dest.addType(std::move(clone));
         }
         else if constexpr (std::is_same_v<T, NegationType>)
             return dest.addType(NegationType{a.ty});
         else if constexpr (std::is_same_v<T, TypeFunctionInstanceType>)
         {
-            TypeFunctionInstanceType clone{a.function, a.typeArguments, a.packArguments, a.userFuncName};
+            TypeFunctionInstanceType clone{a.function, a.typeArguments, a.packArguments, a.userFuncName, a.userFuncData};
             return dest.addType(std::move(clone));
         }
         else
@@ -187,13 +190,8 @@ void Tarjan::visitChildren(TypeId ty, int index)
         LUAU_ASSERT(!ttv->boundTo);
         for (const auto& [name, prop] : ttv->props)
         {
-            if (FFlag::LuauSolverV2)
-            {
-                visitChild(prop.readTy);
-                visitChild(prop.writeTy);
-            }
-            else
-                visitChild(prop.type());
+            visitChild(prop.readTy);
+            visitChild(prop.writeTy);
         }
 
         if (ttv->indexer)
@@ -239,21 +237,29 @@ void Tarjan::visitChildren(TypeId ty, int index)
         for (TypePackId a : tfit->packArguments)
             visitChild(a);
     }
-    else if (const ClassType* ctv = get<ClassType>(ty))
+    else if (const ExternType* etv = get<ExternType>(ty))
     {
-        for (const auto& [name, prop] : ctv->props)
-            visitChild(prop.type());
-
-        if (ctv->parent)
-            visitChild(*ctv->parent);
-
-        if (ctv->metatable)
-            visitChild(*ctv->metatable);
-
-        if (ctv->indexer)
+        for (const auto& [name, prop] : etv->props)
         {
-            visitChild(ctv->indexer->indexType);
-            visitChild(ctv->indexer->indexResultType);
+            if (FFlag::LuauSolverV2)
+            {
+                visitChild(prop.readTy);
+                visitChild(prop.writeTy);
+            }
+            else
+                visitChild(prop.type_DEPRECATED());
+        }
+
+        if (etv->parent)
+            visitChild(*etv->parent);
+
+        if (etv->metatable)
+            visitChild(*etv->metatable);
+
+        if (etv->indexer)
+        {
+            visitChild(etv->indexer->indexType);
+            visitChild(etv->indexer->indexResultType);
         }
     }
     else if (const NegationType* ntv = get<NegationType>(ty))
@@ -294,7 +300,7 @@ std::pair<int, bool> Tarjan::indexify(TypeId ty)
     if (fresh)
     {
         index = int(nodes.size());
-        nodes.push_back({ty, nullptr, false, false, index});
+        nodes.emplace_back(ty, nullptr, false, false, index);
     }
 
     return {index, fresh};
@@ -309,7 +315,7 @@ std::pair<int, bool> Tarjan::indexify(TypePackId tp)
     if (fresh)
     {
         index = int(nodes.size());
-        nodes.push_back({nullptr, tp, false, false, index});
+        nodes.emplace_back(nullptr, tp, false, false, index);
     }
 
     return {index, fresh};
@@ -379,9 +385,7 @@ TarjanResult Tarjan::loop()
             {
                 // Original recursion point, update the parent continuation point and start the new element
                 worklist.back() = {index, currEdge + 1, lastEdge};
-                worklist.push_back({childIndex, -1, -1});
-
-                // We need to continue the top-level loop from the start with the new worklist element
+                worklist.emplace_back(childIndex, -1, -1); // We need to continue the top-level loop from the start with the new worklist element
                 foundFresh = true;
                 break;
             }
@@ -437,7 +441,7 @@ TarjanResult Tarjan::visitRoot(TypeId ty)
     ty = log->follow(ty);
 
     auto [index, fresh] = indexify(ty);
-    worklist.push_back({index, -1, -1});
+    worklist.emplace_back(index, -1, -1);
     return loop();
 }
 
@@ -450,7 +454,7 @@ TarjanResult Tarjan::visitRoot(TypePackId tp)
     tp = log->follow(tp);
 
     auto [index, fresh] = indexify(tp);
-    worklist.push_back({index, -1, -1});
+    worklist.emplace_back(index, -1, -1);
     return loop();
 }
 
@@ -527,6 +531,27 @@ void Tarjan::visitSCC(int index)
     }
 }
 
+bool Tarjan::ignoreChildren(TypeId ty)
+{
+    return false;
+}
+
+bool Tarjan::ignoreChildren(TypePackId ty)
+{
+    return false;
+}
+
+// Some subclasses might ignore children visit, but not other actions like replacing the children
+bool Tarjan::ignoreChildrenVisit(TypeId ty)
+{
+    return ignoreChildren(ty);
+}
+
+bool Tarjan::ignoreChildrenVisit(TypePackId ty)
+{
+    return ignoreChildren(ty);
+}
+
 TarjanResult Tarjan::findDirty(TypeId ty)
 {
     return visitRoot(ty);
@@ -535,6 +560,11 @@ TarjanResult Tarjan::findDirty(TypeId ty)
 TarjanResult Tarjan::findDirty(TypePackId tp)
 {
     return visitRoot(tp);
+}
+
+Substitution::Substitution(TypeArena* arena)
+    : Substitution(TxnLog::empty(), arena)
+{
 }
 
 Substitution::Substitution(const TxnLog* log_, TypeArena* arena)
@@ -637,7 +667,7 @@ void Substitution::resetState(const TxnLog* log, TypeArena* arena)
 
 TypeId Substitution::clone(TypeId ty)
 {
-    return shallowClone(ty, *arena, log, /* alwaysClone */ true);
+    return shallowClone(ty, *arena, log);
 }
 
 TypePackId Substitution::clone(TypePackId tp)
@@ -745,15 +775,10 @@ void Substitution::replaceChildren(TypeId ty)
         LUAU_ASSERT(!ttv->boundTo);
         for (auto& [name, prop] : ttv->props)
         {
-            if (FFlag::LuauSolverV2)
-            {
-                if (prop.readTy)
-                    prop.readTy = replace(prop.readTy);
-                if (prop.writeTy)
-                    prop.writeTy = replace(prop.writeTy);
-            }
-            else
-                prop.setType(replace(prop.type()));
+            if (prop.readTy)
+                prop.readTy = replace(prop.readTy);
+            if (prop.writeTy)
+                prop.writeTy = replace(prop.writeTy);
         }
 
         if (ttv->indexer)
@@ -799,21 +824,31 @@ void Substitution::replaceChildren(TypeId ty)
         for (TypePackId& a : tfit->packArguments)
             a = replace(a);
     }
-    else if (ClassType* ctv = getMutable<ClassType>(ty))
+    else if (ExternType* etv = getMutable<ExternType>(ty))
     {
-        for (auto& [name, prop] : ctv->props)
-            prop.setType(replace(prop.type()));
-
-        if (ctv->parent)
-            ctv->parent = replace(*ctv->parent);
-
-        if (ctv->metatable)
-            ctv->metatable = replace(*ctv->metatable);
-
-        if (ctv->indexer)
+        for (auto& [name, prop] : etv->props)
         {
-            ctv->indexer->indexType = replace(ctv->indexer->indexType);
-            ctv->indexer->indexResultType = replace(ctv->indexer->indexResultType);
+            if (FFlag::LuauSolverV2)
+            {
+                if (prop.readTy)
+                    prop.readTy = replace(prop.readTy);
+                if (prop.writeTy)
+                    prop.writeTy = replace(prop.writeTy);
+            }
+            else
+                prop.setType(replace(prop.type_DEPRECATED()));
+        }
+
+        if (etv->parent)
+            etv->parent = replace(*etv->parent);
+
+        if (etv->metatable)
+            etv->metatable = replace(*etv->metatable);
+
+        if (etv->indexer)
+        {
+            etv->indexer->indexType = replace(etv->indexer->indexType);
+            etv->indexer->indexResultType = replace(etv->indexer->indexResultType);
         }
     }
     else if (NegationType* ntv = getMutable<NegationType>(ty))
@@ -851,6 +886,15 @@ void Substitution::replaceChildren(TypePackId tp)
         for (TypePackId& t : tfitp->packArguments)
             t = replace(t);
     }
+}
+
+template<typename Ty>
+std::optional<Ty> Substitution::replace(std::optional<Ty> ty)
+{
+    if (ty)
+        return replace(*ty);
+    else
+        return std::nullopt;
 }
 
 } // namespace Luau

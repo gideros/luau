@@ -1,14 +1,18 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/IostreamHelpers.h"
+#include "Luau/Error.h"
 #include "Luau/ToString.h"
 #include "Luau/TypePath.h"
+
+#include <type_traits>
 
 namespace Luau
 {
 
 std::ostream& operator<<(std::ostream& stream, const Position& position)
 {
-    return stream << "{ line = " << position.line << ", col = " << position.column << " }";
+    // We add one so that the numbers we display match what people see in their text editors.
+    return stream << "{ line = " << (position.line + 1) << ", col = " << (position.column + 1) << " }";
 }
 
 std::ostream& operator<<(std::ostream& stream, const Location& location)
@@ -40,6 +44,8 @@ static void errorToString(std::ostream& stream, const T& err)
         stream << "NotATable { " << toString(err.ty) << " }";
     else if constexpr (std::is_same_v<T, CannotExtendTable>)
         stream << "CannotExtendTable { " << toString(err.tableType) << ", context " << err.context << ", prop \"" << err.prop << "\" }";
+    else if constexpr (std::is_same_v<T, CannotCompareUnrelatedTypes>)
+        stream << "CannotCompareUnrelatedTypes { " << toString(err.left) << ", " << toString(err.right) << ", op '" << toString(err.op) << "' }";
     else if constexpr (std::is_same_v<T, OnlyTablesCanHaveMethods>)
         stream << "OnlyTablesCanHaveMethods { " << toString(err.tableType) << " }";
     else if constexpr (std::is_same_v<T, DuplicateTypeDefinition>)
@@ -193,8 +199,8 @@ static void errorToString(std::ostream& stream, const T& err)
         stream << "NormalizationTooComplex { }";
     else if constexpr (std::is_same_v<T, TypePackMismatch>)
         stream << "TypePackMismatch { wanted = '" + toString(err.wantedTp) + "', given = '" + toString(err.givenTp) + "' }";
-    else if constexpr (std::is_same_v<T, DynamicPropertyLookupOnClassesUnsafe>)
-        stream << "DynamicPropertyLookupOnClassesUnsafe { " << toString(err.ty) << " }";
+    else if constexpr (std::is_same_v<T, DynamicPropertyLookupOnExternTypesUnsafe>)
+        stream << "DynamicPropertyLookupOnExternTypesUnsafe { " << toString(err.ty) << " }";
     else if constexpr (std::is_same_v<T, UninhabitedTypeFunction>)
         stream << "UninhabitedTypeFunction { " << toString(err.ty) << " }";
     else if constexpr (std::is_same_v<T, ExplicitFunctionAnnotationRecommended>)
@@ -203,8 +209,8 @@ static void errorToString(std::ostream& stream, const T& err)
         for (auto [s, t] : err.recommendedArgs)
             recArgs += " " + s + ": " + toString(t);
         recArgs += " ]";
-        stream << "ExplicitFunctionAnnotationRecommended { recommmendedReturn = '" + toString(err.recommendedReturn) +
-                      "', recommmendedArgs = " + recArgs + "}";
+        stream << "ExplicitFunctionAnnotationRecommended { recommendedReturn = '" + toString(err.recommendedReturn) +
+                      "', recommendedArgs = " + recArgs + "}";
     }
     else if constexpr (std::is_same_v<T, UninhabitedTypePackFunction>)
         stream << "UninhabitedTypePackFunction { " << toString(err.tp) << " }";
@@ -229,6 +235,8 @@ static void errorToString(std::ostream& stream, const T& err)
         stream << "UnexpectedTypePackInSubtyping {  tp = '" + toString(err.tp) + "' }";
     else if constexpr (std::is_same_v<T, UserDefinedTypeFunctionError>)
         stream << "UserDefinedTypeFunctionError { " << err.message << " }";
+    else if constexpr (std::is_same_v<T, ReservedIdentifier>)
+        stream << "ReservedIdentifier { " << err.name << " }";
     else if constexpr (std::is_same_v<T, CannotAssignToNever>)
     {
         stream << "CannotAssignToNever { rvalueType = '" << toString(err.rhsType) << "', reason = '" << err.reason << "', cause = { ";
@@ -246,6 +254,53 @@ static void errorToString(std::ostream& stream, const T& err)
 
         stream << " } } ";
     }
+    else if constexpr (std::is_same_v<T, UnexpectedArrayLikeTableItem>)
+        stream << "UnexpectedArrayLikeTableItem {}";
+    else if constexpr (std::is_same_v<T, CannotCheckDynamicStringFormatCalls>)
+        stream << "CannotCheckDynamicStringFormatCalls {}";
+    else if constexpr (std::is_same_v<T, GenericTypeCountMismatch>)
+    {
+        stream << "GenericTypeCountMismatch { subTyGenericCount = " << err.subTyGenericCount << ", superTyGenericCount = " << err.superTyGenericCount
+               << " }";
+    }
+    else if constexpr (std::is_same_v<T, GenericTypePackCountMismatch>)
+    {
+        stream << "GenericTypePackCountMismatch { subTyGenericPackCount = " << err.subTyGenericPackCount
+               << ", superTyGenericPackCount = " << err.superTyGenericPackCount << " }";
+    }
+    else if constexpr (std::is_same_v<T, MultipleNonviableOverloads>)
+        stream << "MultipleNonviableOverloads { attemptedArgCount = " << err.attemptedArgCount << " }";
+    else if constexpr (std::is_same_v<T, RecursiveRestraintViolation>)
+        stream << "RecursiveRestraintViolation";
+    else if constexpr (std::is_same_v<T, GenericBoundsMismatch>)
+    {
+        stream << "GenericBoundsMismatch { genericName = " << std::string{err.genericName} << ", lowerBounds = [";
+        for (size_t i = 0; i < err.lowerBounds.size(); ++i)
+        {
+            if (i > 0)
+                stream << ", ";
+            stream << toString(err.lowerBounds[i]);
+        }
+        stream << "], upperBounds = [";
+        for (size_t i = 0; i < err.upperBounds.size(); ++i)
+        {
+            if (i > 0)
+                stream << ", ";
+            stream << toString(err.upperBounds[i]);
+        }
+        stream << "] }";
+    }
+    else if constexpr (std::is_same_v<T, InstantiateGenericsOnNonFunction>)
+        stream << "InstantiateGenericsOnNonFunctionInstantiateGenericsOnNonFunction { interestingEdgeCase = " << err.interestingEdgeCase << " }";
+    else if constexpr (std::is_same_v<T, TypeInstantiationCountMismatch>)
+        stream << "TypeInstantiationCountMismatch { functionName = " << err.functionName.value_or("<unknown>")
+               << ", functionType = " << toString(err.functionType) << ", providedTypes = " << err.providedTypes
+               << ", maximumTypes = " << err.maximumTypes << ", providedTypePacks = " << err.providedTypePacks
+               << ", maximumTypePacks = " << err.maximumTypePacks << " }";
+    else if constexpr (std::is_same_v<T, UnappliedTypeFunction>)
+        stream << "UnappliedTypeFunction {}";
+    else if constexpr (std::is_same_v<T, AmbiguousFunctionCall>)
+        stream << "AmbiguousFunctionCall { " << toString(err.function) << ", " << toString(err.arguments) << " }";
     else
         static_assert(always_false_v<T>, "Non-exhaustive type switch");
 }
@@ -258,6 +313,22 @@ std::ostream& operator<<(std::ostream& stream, const CannotAssignToNever::Reason
         return stream << "PropertyNarrowed";
     default:
         return stream << "UnknownReason";
+    }
+}
+
+std::ostream& operator<<(std::ostream& stream, const InstantiateGenericsOnNonFunction::InterestingEdgeCase& edgeCase)
+{
+    switch (edgeCase)
+    {
+    case InstantiateGenericsOnNonFunction::InterestingEdgeCase::None:
+        return stream << "None";
+    case InstantiateGenericsOnNonFunction::InterestingEdgeCase::MetatableCall:
+        return stream << "MetatableCall";
+    case InstantiateGenericsOnNonFunction::InterestingEdgeCase::Intersection:
+        return stream << "Intersection";
+    default:
+        LUAU_ASSERT(false);
+        return stream << "Unknown";
     }
 }
 

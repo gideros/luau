@@ -3,6 +3,7 @@
 #include "Luau/AssemblyBuilderA64.h"
 #include "Luau/CodeAllocator.h"
 #include "Luau/CodeBlockUnwind.h"
+#include "Luau/CodeGen.h"
 #include "Luau/UnwindBuilder.h"
 #include "Luau/UnwindBuilderDwarf2.h"
 #include "Luau/UnwindBuilderWin.h"
@@ -735,7 +736,8 @@ TEST_CASE("GeneratedCodeExecutionWithThrowOutsideTheGateX64")
     uint8_t* nativeData1;
     size_t sizeNativeData1;
     uint8_t* nativeEntry1;
-    REQUIRE(allocator.allocate(build.data.data(), build.data.size(), build.code.data(), build.code.size(), nativeData1, sizeNativeData1, nativeEntry1)
+    REQUIRE(
+        allocator.allocate(build.data.data(), build.data.size(), build.code.data(), build.code.size(), nativeData1, sizeNativeData1, nativeEntry1)
     );
     REQUIRE(nativeEntry1);
 
@@ -799,7 +801,7 @@ TEST_CASE("GeneratedCodeExecutionA64")
     build.ldrb(w2, x2);
     build.sub(x1, x1, x2);
 
-    build.add(x1, x1, 2);
+    build.add(x1, x1, uint16_t(2));
     build.add(x0, x0, x1, /* LSL */ 1);
 
     build.ret();
@@ -831,7 +833,6 @@ TEST_CASE("GeneratedCodeExecutionA64")
     CHECK(result == 42);
 }
 
-#if 0
 static void throwing(int64_t arg)
 {
     CHECK(arg == 25);
@@ -853,19 +854,19 @@ TEST_CASE("GeneratedCodeExecutionWithThrowA64")
 
     unwind->startInfo(UnwindBuilder::A64);
 
-    build.sub(sp, sp, 32);
+    build.sub(sp, sp, uint16_t(32));
     build.stp(x29, x30, mem(sp));
     build.str(x28, mem(sp, 16));
     build.mov(x29, sp);
 
     Label prologueEnd = build.setLabel();
 
-    build.add(x0, x0, 15);
+    build.add(x0, x0, uint16_t(15));
     build.blr(x1);
 
     build.ldr(x28, mem(sp, 16));
     build.ldp(x29, x30, mem(sp));
-    build.add(sp, sp, 32);
+    build.add(sp, sp, uint16_t(32));
 
     build.ret();
 
@@ -914,7 +915,6 @@ TEST_CASE("GeneratedCodeExecutionWithThrowA64")
         CHECK(strcmp(error.what(), "testing") == 0);
     }
 }
-#endif
 
 #endif
 

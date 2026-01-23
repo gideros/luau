@@ -368,16 +368,14 @@ typedef struct Udata
 
     int len;
 
-    struct Table* metatable;
+    struct LuaTable* metatable;
 
-    union
-    {
-        char data[1];      // userdata is allocated right after the header
-        L_Umaxalign dummy; // ensures maximum alignment for data
-    };
+    // userdata is allocated right after the header
+    // while the alignment is only 8 here, for sizes starting at 16 bytes, 16 byte alignment is provided
+    alignas(8) char data[1];
 } Udata;
 
-typedef struct Buffer
+typedef struct LuauBuffer
 {
     CommonHeader;
 
@@ -385,11 +383,7 @@ typedef struct Buffer
     unsigned int atype;
     unsigned int vx,vy,vz; //Vector access factors
 
-    union
-    {
-        char data[1];      // buffer is allocated right after the header
-        L_Umaxalign dummy; // ensures maximum alignment for data
-    };
+    alignas(8) char data[1];
 } Buffer;
 
 /*
@@ -400,13 +394,11 @@ typedef struct Proto
 {
     CommonHeader;
 
-
     uint8_t nups; // number of upvalues
     uint8_t numparams;
     uint8_t is_vararg;
     uint8_t maxstacksize;
     uint8_t flags;
-
 
     TValue* k;              // constants used by the function
     Instruction* code;      // function bytecode
@@ -415,7 +407,6 @@ typedef struct Proto
 
     void* execdata;
     uintptr_t exectarget;
-
 
     uint8_t* lineinfo;      // for each instruction, line number as a delta from baseline
     int* abslineinfo;       // baseline line info, one entry for each 1<<linegaplog2 instructions; allocated after lineinfo
@@ -432,7 +423,6 @@ typedef struct Proto
     void* userdata;
 
     GCObject* gclist;
-
 
     int sizecode;
     int sizep;
@@ -498,7 +488,7 @@ typedef struct Closure
     uint8_t preload;
 
     GCObject* gclist;
-    struct Table* env;
+    struct LuaTable* env;
 
     union
     {
@@ -563,16 +553,15 @@ typedef struct LuaNode
     }
 
 // clang-format off
-typedef struct Table
+typedef struct LuaTable
 {
     CommonHeader;
-
 
     uint8_t tmcache;    // 1<<p means tagmethod(p) is not present
     uint8_t readonly;   // sandboxing feature to prohibit writes to table
     uint8_t safeenv;    // environment doesn't share globals with other scripts
     uint8_t lsizenode;  // log2 of size of `node' array
-    uint8_t nodemask8; // (1<<lsizenode)-1, truncated to 8 bits
+    uint8_t nodemask8;  // (1<<lsizenode)-1, truncated to 8 bits
 
     int sizearray; // size of `array' array
     union
@@ -581,8 +570,7 @@ typedef struct Table
         int aboundary; // negated 'boundary' of `array' array; iff aboundary < 0
     };
 
-
-    struct Table* metatable;
+    struct LuaTable* metatable;
     TValue* array;  // array part
     LuaNode* node;
     GCObject* gclist;
@@ -591,7 +579,7 @@ typedef struct Table
     uint8_t shared;
     LuaSpinLock lock;
 #endif
-} Table;
+} LuaTable;
 // clang-format on
 
 #ifdef LUAU_MULTITHREAD

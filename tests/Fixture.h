@@ -1,8 +1,8 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #pragma once
 
+#include "Luau/BuiltinTypeFunctions.h"
 #include "Luau/Config.h"
-#include "Luau/Differ.h"
 #include "Luau/Error.h"
 #include "Luau/FileResolver.h"
 #include "Luau/Frontend.h"
@@ -26,16 +26,58 @@
 #include <vector>
 
 LUAU_FASTFLAG(DebugLuauFreezeArena)
+LUAU_FASTFLAG(DebugLuauForceAllNewSolverTests)
+
+LUAU_FASTFLAG(DebugLuauAlwaysShowConstraintSolvingIncomplete);
+
+#define DOES_NOT_PASS_NEW_SOLVER_GUARD_IMPL(line) ScopedFastFlag sff_##line{FFlag::LuauSolverV2, FFlag::DebugLuauForceAllNewSolverTests};
+
+#define DOES_NOT_PASS_NEW_SOLVER_GUARD() DOES_NOT_PASS_NEW_SOLVER_GUARD_IMPL(__LINE__)
 
 namespace Luau
 {
 
 struct TypeChecker;
 
+struct TestRequireNode : RequireNode
+{
+    TestRequireNode(ModuleName moduleName, std::unordered_map<ModuleName, std::string>* allSources)
+        : moduleName(std::move(moduleName))
+        , allSources(allSources)
+    {
+    }
+
+    std::string getLabel() const override;
+    std::string getPathComponent() const override;
+    std::unique_ptr<RequireNode> resolvePathToNode(const std::string& path) const override;
+    std::vector<std::unique_ptr<RequireNode>> getChildren() const override;
+    std::vector<RequireAlias> getAvailableAliases() const override;
+
+    ModuleName moduleName;
+    std::unordered_map<ModuleName, std::string>* allSources;
+};
+
+struct TestFileResolver;
+struct TestRequireSuggester : RequireSuggester
+{
+    TestRequireSuggester(TestFileResolver* resolver)
+        : resolver(resolver)
+    {
+    }
+
+    std::unique_ptr<RequireNode> getNode(const ModuleName& name) const override;
+    TestFileResolver* resolver;
+};
+
 struct TestFileResolver
     : FileResolver
     , ModuleResolver
 {
+    TestFileResolver()
+        : FileResolver(std::make_shared<TestRequireSuggester>(this))
+    {
+    }
+
     std::optional<ModuleInfo> resolveModuleInfo(const ModuleName& currentModuleName, const AstExpr& pathExpr) override;
 
     const ModulePtr getModule(const ModuleName& moduleName) const override;
@@ -44,7 +86,7 @@ struct TestFileResolver
 
     std::optional<SourceCode> readSource(const ModuleName& name) override;
 
-    std::optional<ModuleInfo> resolveModule(const ModuleInfo* context, AstExpr* expr) override;
+    std::optional<ModuleInfo> resolveModule(const ModuleInfo* context, AstExpr* expr, const TypeCheckLimits& limits) override;
 
     std::string getHumanReadableModuleName(const ModuleName& name) const override;
 
@@ -60,18 +102,22 @@ struct TestConfigResolver : ConfigResolver
     Config defaultConfig;
     std::unordered_map<ModuleName, Config> configFiles;
 
-    const Config& getConfig(const ModuleName& name) const override;
+    const Config& getConfig(const ModuleName& name, const TypeCheckLimits& limits = {}) const override;
 };
 
 struct Fixture
 {
     explicit Fixture(bool prepareAutocomplete = false);
+
+    explicit Fixture(const Fixture&) = delete;
+    Fixture& operator=(const Fixture&) = delete;
+
     ~Fixture();
 
     // Throws Luau::ParseErrors if the parse fails.
     AstStatBlock* parse(const std::string& source, const ParseOptions& parseOptions = {});
-    CheckResult check(Mode mode, const std::string& source);
-    CheckResult check(const std::string& source);
+    CheckResult check(Mode mode, const std::string& source, std::optional<FrontendOptions> = std::nullopt);
+    CheckResult check(const std::string& source, std::optional<FrontendOptions> = std::nullopt);
 
     LintResult lint(const std::string& source, const std::optional<LintOptions>& lintOptions = {});
     LintResult lintModule(const ModuleName& moduleName, const std::optional<LintOptions>& lintOptions = {});
@@ -83,11 +129,11 @@ struct Fixture
     // Verify a parse error occurs and the parse error message has the specified prefix
     ParseResult matchParseErrorPrefix(const std::string& source, const std::string& prefix);
 
-    ModulePtr getMainModule();
+    ModulePtr getMainModule(bool forAutocomplete = false);
     SourceModule* getMainSourceModule();
 
     std::optional<PrimitiveType::Type> getPrimitiveType(TypeId ty);
-    std::optional<TypeId> getType(const std::string& name);
+    std::optional<TypeId> getType(const std::string& name, bool forAutocomplete = false);
     TypeId requireType(const std::string& name);
     TypeId requireType(const ModuleName& moduleName, const std::string& name);
     TypeId requireType(const ModulePtr& module, const std::string& name);
@@ -102,6 +148,8 @@ struct Fixture
     TypeId requireTypeAlias(const std::string& name);
     TypeId requireExportedType(const ModuleName& moduleName, const std::string& name);
 
+    TypeId parseType(std::string_view src);
+
     // While most flags can be flipped inside the unit test, some code changes affect the state that is part of Fixture initialization
     // Most often those are changes related to builtin type definitions.
     // In that case, flag can be forced to 'true' using the example below:
@@ -111,13 +159,17 @@ struct Fixture
     // This is useful for tracking down violations of Luau's memory model.
     ScopedFastFlag sff_DebugLuauFreezeArena{FFlag::DebugLuauFreezeArena, true};
 
+    // This makes sure that errant cases of constraint solving failing to complete still pop up in tests.
+    ScopedFastFlag sff_DebugLuauAlwaysShowConstraintSolvingIncomplete{FFlag::DebugLuauAlwaysShowConstraintSolvingIncomplete, true};
+
     TestFileResolver fileResolver;
     TestConfigResolver configResolver;
     NullModuleResolver moduleResolver;
     std::unique_ptr<SourceModule> sourceModule;
-    Frontend frontend;
     InternalErrorReporter ice;
-    NotNull<BuiltinTypes> builtinTypes;
+    Allocator allocator;
+    AstNameTable nameTable{allocator};
+    TypeArena arena;
 
     std::string decorateWithTypes(const std::string& code);
 
@@ -133,12 +185,34 @@ struct Fixture
 
     void registerTestTypes();
 
-    LoadDefinitionFileResult loadDefinition(const std::string& source);
+    LoadDefinitionFileResult loadDefinition(const std::string& source, bool forAutocomplete = false);
+    // TODO: test theory about dynamic dispatch
+    NotNull<BuiltinTypes> getBuiltins();
+    const BuiltinTypeFunctions& getBuiltinTypeFunctions();
+    virtual Frontend& getFrontend();
+
+    // On platforms that support it, adjust our internal stack guard to
+    // limit how much address space we should use before we blow up.  We
+    // use this to test the stack guard itself.
+    void limitStackSize(size_t size);
+
+private:
+    bool hasDumpedErrors = false;
+
+protected:
+    bool forAutocomplete = false;
+    std::optional<Frontend> frontend;
+    BuiltinTypes* builtinTypes = nullptr;
+
+    std::vector<ScopedFastInt> dynamicScopedInts;
 };
 
 struct BuiltinsFixture : Fixture
 {
-    BuiltinsFixture(bool prepareAutocomplete = false);
+    explicit BuiltinsFixture(bool prepareAutocomplete = false);
+
+    // For the purpose of our tests, we're always the latest version of type functions.
+    Frontend& getFrontend() override;
 };
 
 std::optional<std::string> pathExprToModuleName(const ModuleName& currentModuleName, const std::vector<std::string_view>& segments);
@@ -169,86 +243,20 @@ std::optional<TypeId> lookupName(ScopePtr scope, const std::string& name); // Wa
 
 std::optional<TypeId> linearSearchForBinding(Scope* scope, const char* name);
 
-void registerHiddenTypes(Frontend* frontend);
-void createSomeClasses(Frontend* frontend);
+void registerHiddenTypes(Frontend& frontend);
+void createSomeExternTypes(Frontend& frontend);
 
-template<typename BaseFixture>
-struct DifferFixtureGeneric : BaseFixture
+template<typename E>
+const E* findError(const CheckResult& result)
 {
-    std::string normalizeWhitespace(std::string msg)
+    for (const auto& e : result.errors)
     {
-        std::string normalizedMsg = "";
-        bool wasWhitespace = true;
-        for (char c : msg)
-        {
-            bool isWhitespace = c == ' ' || c == '\n';
-            if (wasWhitespace && isWhitespace)
-                continue;
-            normalizedMsg += isWhitespace ? ' ' : c;
-            wasWhitespace = isWhitespace;
-        }
-        if (wasWhitespace)
-            normalizedMsg.pop_back();
-        return normalizedMsg;
+        if (auto p = get<E>(e))
+            return p;
     }
 
-    void compareNe(TypeId left, TypeId right, const std::string& expectedMessage, bool multiLine)
-    {
-        compareNe(left, std::nullopt, right, std::nullopt, expectedMessage, multiLine);
-    }
-
-    void compareNe(
-        TypeId left,
-        std::optional<std::string> symbolLeft,
-        TypeId right,
-        std::optional<std::string> symbolRight,
-        const std::string& expectedMessage,
-        bool multiLine
-    )
-    {
-        DifferResult diffRes = diffWithSymbols(left, right, symbolLeft, symbolRight);
-        REQUIRE_MESSAGE(diffRes.diffError.has_value(), "Differ did not report type error, even though types are unequal");
-        std::string diffMessage = diffRes.diffError->toString(multiLine);
-        CHECK_EQ(expectedMessage, diffMessage);
-    }
-
-    void compareTypesNe(
-        const std::string& leftSymbol,
-        const std::string& rightSymbol,
-        const std::string& expectedMessage,
-        bool forwardSymbol = false,
-        bool multiLine = false
-    )
-    {
-        if (forwardSymbol)
-        {
-            compareNe(
-                BaseFixture::requireType(leftSymbol), leftSymbol, BaseFixture::requireType(rightSymbol), rightSymbol, expectedMessage, multiLine
-            );
-        }
-        else
-        {
-            compareNe(
-                BaseFixture::requireType(leftSymbol), std::nullopt, BaseFixture::requireType(rightSymbol), std::nullopt, expectedMessage, multiLine
-            );
-        }
-    }
-
-    void compareEq(TypeId left, TypeId right)
-    {
-        DifferResult diffRes = diff(left, right);
-        CHECK(!diffRes.diffError);
-        if (diffRes.diffError)
-            INFO(diffRes.diffError->toString());
-    }
-
-    void compareTypesEq(const std::string& leftSymbol, const std::string& rightSymbol)
-    {
-        compareEq(BaseFixture::requireType(leftSymbol), BaseFixture::requireType(rightSymbol));
-    }
-};
-using DifferFixture = DifferFixtureGeneric<Fixture>;
-using DifferFixtureWithBuiltins = DifferFixtureGeneric<BuiltinsFixture>;
+    return nullptr;
+}
 
 } // namespace Luau
 
@@ -287,3 +295,109 @@ using DifferFixtureWithBuiltins = DifferFixtureGeneric<BuiltinsFixture>;
     } while (false)
 
 #define LUAU_CHECK_NO_ERRORS(result) LUAU_CHECK_ERROR_COUNT(0, result)
+
+#define LUAU_CHECK_HAS_KEY(map, key) \
+    do \
+    { \
+        auto&& _m = (map); \
+        auto&& _k = (key); \
+        const size_t count = _m.count(_k); \
+        CHECK_MESSAGE(count, "Map should have key \"" << _k << "\""); \
+        if (!count) \
+        { \
+            MESSAGE("Keys: (count " << _m.size() << ")"); \
+            for (const auto& [k, v] : _m) \
+            { \
+                MESSAGE("\tkey: " << k); \
+            } \
+        } \
+    } while (false)
+
+#define LUAU_CHECK_HAS_NO_KEY(map, key) \
+    do \
+    { \
+        auto&& _m = (map); \
+        auto&& _k = (key); \
+        const size_t count = _m.count(_k); \
+        CHECK_MESSAGE(!count, "Map should not have key \"" << _k << "\""); \
+        if (count) \
+        { \
+            MESSAGE("Keys: (count " << _m.size() << ")"); \
+            for (const auto& [k, v] : _m) \
+            { \
+                MESSAGE("\tkey: " << k); \
+            } \
+        } \
+    } while (false)
+
+#define LUAU_REQUIRE_ERROR(result, Type) \
+    do \
+    { \
+        using T = Type; \
+        const auto& res = (result); \
+        if (!findError<T>(res)) \
+        { \
+            dumpErrors(res); \
+            REQUIRE_MESSAGE(false, "Expected to find " #Type " error"); \
+        } \
+    } while (false)
+
+#define LUAU_CHECK_ERROR(result, Type) \
+    do \
+    { \
+        using T = Type; \
+        const auto& res = (result); \
+        if (!findError<T>(res)) \
+        { \
+            dumpErrors(res); \
+            CHECK_MESSAGE(false, "Expected to find " #Type " error"); \
+        } \
+    } while (false)
+
+#define LUAU_REQUIRE_NO_ERROR(result, Type) \
+    do \
+    { \
+        using T = Type; \
+        const auto& res = (result); \
+        if (findError<T>(res)) \
+        { \
+            dumpErrors(res); \
+            REQUIRE_MESSAGE(false, "Expected to find no " #Type " error"); \
+        } \
+    } while (false)
+
+#define LUAU_CHECK_NO_ERROR(result, Type) \
+    do \
+    { \
+        using T = Type; \
+        const auto& res = (result); \
+        if (findError<T>(res)) \
+        { \
+            dumpErrors(res); \
+            CHECK_MESSAGE(false, "Expected to find no " #Type " error"); \
+        } \
+    } while (false)
+
+#define CHECK_LONG_STRINGS_EQ(a, b) \
+    do \
+    { \
+        const auto aa = (a); \
+        const auto bb = (b); \
+        const auto aLines = split(aa, '\n'); \
+        const auto bLines = split(bb, '\n'); \
+        CHECK_MESSAGE(aLines.size() == bLines.size(), "Line counts don't match: " << aLines.size() << " != " << bLines.size()); \
+        bool anyWrong = false; \
+        for (size_t i = 0; i < std::min(aLines.size(), bLines.size()); ++i) \
+        { \
+            auto aLine = strip(aLines.at(i)); \
+            auto bLine = strip(bLines.at(i)); \
+            if (aLine != bLine) \
+                anyWrong = true; \
+            CHECK_MESSAGE(aLine == bLine, "Mismatch on line " << i << " between:\n\t«" << aLine << "»\nand\t«" << bLine << "»\n"); \
+        } \
+        if (anyWrong) \
+        { \
+            MESSAGE(aa); \
+            MESSAGE(bb); \
+        } \
+    } while (0)

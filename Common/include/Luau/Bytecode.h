@@ -17,7 +17,7 @@
 //     E - least-significant byte for the opcode, followed by E (24-bit integer). E is a signed integer that commonly specifies a jump offset
 //
 // Instruction word is sometimes followed by one extra word, indicated as AUX - this is just a 32-bit word and is decoded according to the specification for each opcode.
-// For each opcode the encoding is *static* - that is, based on the opcode you know a-priory how large the instruction is, with the exception of NEWCLOSURE
+// For each opcode the encoding is *static* - that is, based on the opcode you know apriori how large the instruction is, with the exception of NEWCLOSURE
 
 // # Bytecode indices
 // Bytecode instructions commonly refer to integer values that define offsets or indices for various entities. For each type, there's a maximum encodable value.
@@ -51,6 +51,7 @@
 // # Bytecode type information history
 // Version 1: (from bytecode version 4) Type information for function signature. Currently supported.
 // Version 2: (from bytecode version 4) Type information for arguments, upvalues, locals and some temporaries. Currently supported.
+// Version 3: (from bytecode version 5) Type information for userdata type names and their index mapping. Currently supported.
 
 // Bytecode opcode, part of the instruction header
 enum LuauOpcode
@@ -298,6 +299,7 @@ enum LuauOpcode
 
     // FORGPREP_INEXT: prepare FORGLOOP with 2 output variables (no AUX encoding), assuming generator is luaB_inext, and jump to FORGLOOP
     // A: target register (see FORGLOOP for register layout)
+    // D: jump offset (-32768..32767)
     LOP_FORGPREP_INEXT,
 
     // FASTCALL3: perform a fast call of a built-in function using 3 register arguments
@@ -310,6 +312,7 @@ enum LuauOpcode
 
     // FORGPREP_NEXT: prepare FORGLOOP with 2 output variables (no AUX encoding), assuming generator is luaB_next, and jump to FORGLOOP
     // A: target register (see FORGLOOP for register layout)
+    // D: jump offset (-32768..32767)
     LOP_FORGPREP_NEXT,
 
     // NATIVECALL: start executing new function in native code
@@ -464,6 +467,23 @@ enum LuauOpcode
 
 // E encoding: one signed 24-bit value
 #define LUAU_INSN_E(insn) (int32_t(insn) >> 8)
+
+// Auxiliary AB: two 8-bit values, containing registers or small numbers
+// Used in FASTCALL3
+#define LUAU_INSN_AUX_A(aux) ((aux) & 0xff)
+#define LUAU_INSN_AUX_B(aux) (((aux) >> 8) & 0xff)
+
+// Auxiliary KV: unsigned 24-bit constant index
+// Used in LOP_JUMPXEQK* instructions
+#define LUAU_INSN_AUX_KV(aux) ((aux) & 0xffffff)
+
+// Auxiliary KB: 1-bit constant value
+// Used in LOP_JUMPXEQKB instruction
+#define LUAU_INSN_AUX_KB(aux) ((aux) & 0x1)
+
+// Auxiliary NOT: 1-bit negation flag
+// Used in LOP_JUMPXEQK* instructions
+#define LUAU_INSN_AUX_NOT(aux) ((aux) >> 31)
 
 // Bytecode tags, used internally for bytecode encoded as a string
 enum LuauBytecodeTag
@@ -630,6 +650,30 @@ enum LuauBuiltinFunction
     LBF_BUFFER_WRITEF32,
     LBF_BUFFER_READF64,
     LBF_BUFFER_WRITEF64,
+
+    // vector.
+    LBF_VECTOR_MAGNITUDE,
+    LBF_VECTOR_NORMALIZE,
+    LBF_VECTOR_CROSS,
+    LBF_VECTOR_DOT,
+    LBF_VECTOR_FLOOR,
+    LBF_VECTOR_CEIL,
+    LBF_VECTOR_ABS,
+    LBF_VECTOR_SIGN,
+    LBF_VECTOR_CLAMP,
+    LBF_VECTOR_MIN,
+    LBF_VECTOR_MAX,
+
+    // math.lerp
+    LBF_MATH_LERP,
+
+    // vector.lerp
+    LBF_VECTOR_LERP,
+
+    // math.
+    LBF_MATH_ISNAN,
+    LBF_MATH_ISINF,
+    LBF_MATH_ISFINITE
 };
 
 // Capture type, used in LOP_CAPTURE

@@ -2445,8 +2445,8 @@ int registerReporter(const char* name, int priority, bool isReporter) {
                                                        __LINE__, #expr, #__VA_ARGS__, message);    \
             try {                                                                                  \
                 DOCTEST_CAST_TO_VOID(expr)                                                         \
-            } catch(const typename doctest::detail::types::remove_const<                           \
-                    typename doctest::detail::types::remove_reference<__VA_ARGS__>::type>::type&) {\
+            } catch(const typename doctest::detail::types::remove_const< /* NOLINT(modernize-type-traits) */ \
+                    typename doctest::detail::types::remove_reference<__VA_ARGS__>::type>::type&) { /* NOLINT(modernize-type-traits) */ \
                 DOCTEST_RB.translateException();                                                   \
                 DOCTEST_RB.m_threw_as = true;                                                      \
             } catch(...) { DOCTEST_RB.translateException(); }                                      \
@@ -3319,7 +3319,7 @@ namespace detail {
 
 namespace timer_large_integer
 {
-    
+
 #if defined(DOCTEST_PLATFORM_WINDOWS)
     using type = ULONGLONG;
 #else // DOCTEST_PLATFORM_WINDOWS
@@ -3465,7 +3465,7 @@ using ticks_t = timer_large_integer::type;
         MultiLaneAtomic<int> numAssertsCurrentTest_atomic;
         MultiLaneAtomic<int> numAssertsFailedCurrentTest_atomic;
 
-        std::vector<std::vector<String>> filters = decltype(filters)(9); // 9 different filters
+        std::vector<std::vector<String>> filters = decltype(filters)(10); // 10 different filters
 
         std::vector<IReporter*> reporters_currently_used;
 
@@ -4953,7 +4953,7 @@ namespace detail {
             m_string = tlssPop();
             logged = true;
         }
-        
+
         DOCTEST_ITERATE_THROUGH_REPORTERS(log_message, *this);
 
         const bool isWarn = m_severity & assertType::is_warn;
@@ -5504,7 +5504,7 @@ namespace {
             test_case_start_impl(in);
             xml.ensureTagClosed();
         }
-        
+
         void test_case_reenter(const TestCaseData&) override {}
 
         void test_case_end(const CurrentTestCaseStats& st) override {
@@ -6228,7 +6228,7 @@ namespace {
             subcasesStack.clear();
             currentSubcaseLevel = 0;
         }
-        
+
         void test_case_reenter(const TestCaseData&) override {
             subcasesStack.clear();
         }
@@ -6562,6 +6562,8 @@ void Context::parseArgs(int argc, const char* const* argv, bool withDefaults) {
     parseCommaSepArgs(argc, argv, DOCTEST_CONFIG_OPTIONS_PREFIX "sce=",                p->filters[7]);
     parseCommaSepArgs(argc, argv, DOCTEST_CONFIG_OPTIONS_PREFIX "reporters=",          p->filters[8]);
     parseCommaSepArgs(argc, argv, DOCTEST_CONFIG_OPTIONS_PREFIX "r=",                  p->filters[8]);
+    parseCommaSepArgs(argc, argv, DOCTEST_CONFIG_OPTIONS_PREFIX "test-path=",          p->filters[9]);
+    parseCommaSepArgs(argc, argv, DOCTEST_CONFIG_OPTIONS_PREFIX "tp=",                 p->filters[9]);
     // clang-format on
 
     int    intRes = 0;
@@ -6860,6 +6862,8 @@ int Context::run() {
             skip_me = true;
         if(matchesAny(tc.m_name, p->filters[5], false, p->case_sensitive))
             skip_me = true;
+        if(!matchesAny((String(tc.m_test_suite) + "/" + String(tc.m_name)).c_str(), p->filters[9], true, p->case_sensitive))
+            skip_me = true;
 
         if(!skip_me)
             p->numTestCasesPassingFilters++;
@@ -6911,7 +6915,7 @@ int Context::run() {
             DOCTEST_ITERATE_THROUGH_REPORTERS(test_case_start, tc);
 
             p->timer.start();
-            
+
             bool run_test = true;
 
             do {
@@ -6952,7 +6956,7 @@ DOCTEST_MSVC_SUPPRESS_WARNING_POP
                     run_test = false;
                     p->failure_flags |= TestCaseFailureReason::TooManyFailedAsserts;
                 }
-                
+
                 if(!p->nextSubcaseStack.empty() && run_test)
                     DOCTEST_ITERATE_THROUGH_REPORTERS(test_case_reenter, tc);
                 if(p->nextSubcaseStack.empty())

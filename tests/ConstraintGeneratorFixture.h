@@ -4,8 +4,8 @@
 #include "Luau/ConstraintGenerator.h"
 #include "Luau/ConstraintSolver.h"
 #include "Luau/DcrLogger.h"
-#include "Luau/TypeArena.h"
 #include "Luau/Module.h"
+#include "Luau/TypeArena.h"
 
 #include "Fixture.h"
 #include "ScopedFlags.h"
@@ -19,7 +19,7 @@ struct ConstraintGeneratorFixture : Fixture
     ModulePtr mainModule;
     DcrLogger logger;
     UnifierSharedState sharedState{&ice};
-    Normalizer normalizer{&arena, builtinTypes, NotNull{&sharedState}};
+    Normalizer normalizer{&arena, getBuiltins(), NotNull{&sharedState}, SolverMode::New};
     TypeCheckLimits limits;
     TypeFunctionRuntime typeFunctionRuntime{NotNull{&ice}, NotNull{&limits}};
 

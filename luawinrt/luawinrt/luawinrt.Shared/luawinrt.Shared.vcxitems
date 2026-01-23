@@ -17,13 +17,16 @@
     <ProjectCapability Include="SourceItemsFromImports" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\Ast\src\Allocator.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\Ast\src\Ast.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\Ast\src\Confusables.cpp" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\Ast\src\Cst.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\Ast\src\Lexer.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\Ast\src\Location.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\Ast\src\Parser.cpp" />
-    <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\Ast\src\StringUtils.cpp" />
-    <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\Ast\src\TimeTrace.cpp" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\Ast\src\PrettyPrinter.cpp" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\Common\src\StringUtils.cpp" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\Common\src\TimeTrace.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\Compiler\src\BuiltinFolding.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\Compiler\src\Builtins.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\Compiler\src\BytecodeBuilder.cpp" />
@@ -66,6 +69,7 @@
     <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\VM\src\ltm.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\VM\src\ludata.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\VM\src\lutf8lib.cpp" />
+    <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\VM\src\lveclib.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\VM\src\lvmexecute.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\VM\src\lvmload.cpp" />
     <ClCompile Include="$(MSBuildThisFileDirectory)..\..\..\VM\src\lvmutils.cpp" />

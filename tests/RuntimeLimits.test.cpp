@@ -11,14 +11,22 @@
 
 #include "Fixture.h"
 
+#include "Luau/Error.h"
 #include "doctest.h"
 
 #include <algorithm>
 
 using namespace Luau;
 
+LUAU_FASTINT(LuauSolverConstraintLimit)
+LUAU_FASTINT(LuauTypeInferIterationLimit)
 LUAU_FASTINT(LuauTypeInferRecursionLimit)
+
 LUAU_FASTFLAG(LuauSolverV2)
+LUAU_FASTFLAG(LuauIceLess)
+LUAU_FASTFLAG(LuauDontDynamicallyCreateRedundantSubtypeConstraints)
+LUAU_FASTFLAG(LuauUseNativeStackGuard)
+LUAU_FASTINT(LuauGenericCounterMaxSteps)
 
 struct LimitFixture : BuiltinsFixture
 {
@@ -45,11 +53,9 @@ TEST_SUITE_BEGIN("RuntimeLimits");
 
 TEST_CASE_FIXTURE(LimitFixture, "typescript_port_of_Result_type")
 {
-    ScopedFastFlag sff[] = {
-        {FFlag::LuauSolverV2, false},
-    };
+    DOES_NOT_PASS_NEW_SOLVER_GUARD();
 
-    constexpr const char* src = R"LUA(
+    constexpr const char* src = R"LUAU(
         --!strict
 
         -- Big thanks to Dionysusnu by letting us use this code as part of our test suite!
@@ -274,11 +280,401 @@ TEST_CASE_FIXTURE(LimitFixture, "typescript_port_of_Result_type")
         return {
             Result = Result,
         }
-    )LUA";
+    )LUAU";
 
     CheckResult result = check(src);
 
     CHECK(hasError<CodeTooComplex>(result));
+}
+
+TEST_CASE_FIXTURE(LimitFixture, "Signal_exerpt" * doctest::timeout(1.0))
+{
+    ScopedFastFlag sff[] = {
+        {FFlag::LuauSolverV2, true},
+    };
+
+    constexpr const char* src = R"LUAU(
+        local Signal = {}
+        Signal.ClassName = "Signal"
+        export type Signal<T...> = typeof(setmetatable(
+            {} :: {},
+            {} :: typeof({ __index = Signal })
+        ))
+        function Signal.new<T...>(): Signal<T...>
+            return nil :: any
+        end
+
+        function Signal.Connect<T...>(self: Signal<T...>)
+        end
+
+        function Signal.DisconnectAll<T...>(self: Signal<T...>): ()
+            self._handlerListHead = false
+        end
+
+        function Signal.Fire<T...>(self: Signal<T...>): ()
+            local connection
+            rawget(connection, "_signal")
+        end
+
+        function Signal.Wait<T...>(self: Signal<T...>)
+            connection = self:Connect(function()
+                connection:Disconnect()
+            end)
+        end
+
+        function Signal.Once<T...>(self: Signal<T...>, fn: SignalHandler<T...>): Connection<T...>
+            connection = self:Connect(function() end)
+        end
+    )LUAU";
+
+    CheckResult result = check(src);
+
+    (void)result;
+}
+
+TEST_CASE_FIXTURE(Fixture, "limit_number_of_dynamically_created_constraints")
+{
+    ScopedFastFlag sff{FFlag::LuauSolverV2, true};
+
+    constexpr const char* src = R"(
+        type Array<T> = {T}
+
+        type Hello = Array<Array<Array<Array<Array<Array<Array<Array<Array<Array<number>>>>>>>>>>
+    )";
+
+    {
+        ScopedFastInt sfi{FInt::LuauSolverConstraintLimit, 1};
+        CheckResult result = check(src);
+        LUAU_CHECK_ERROR(result, CodeTooComplex);
+    }
+
+    {
+        ScopedFastInt sfi{FInt::LuauSolverConstraintLimit, 1000};
+        CheckResult result = check(src);
+        LUAU_CHECK_NO_ERRORS(result);
+    }
+
+    {
+        ScopedFastInt sfi{FInt::LuauSolverConstraintLimit, 0};
+        CheckResult result = check(src);
+        LUAU_CHECK_NO_ERRORS(result);
+    }
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "limit_number_of_dynamically_created_constraints_2")
+{
+    ScopedFastFlag sff[] = {
+        {FFlag::LuauSolverV2, true},
+        {FFlag::LuauDontDynamicallyCreateRedundantSubtypeConstraints, true},
+    };
+
+    ScopedFastInt sfi{FInt::LuauSolverConstraintLimit, 50};
+
+    CheckResult result = check(R"(
+        local T = {}
+
+        export type T = typeof(setmetatable(
+            {},
+            {} :: typeof(T)
+        ))
+
+        function T.One(): T
+            return nil :: any
+        end
+
+        function T.Two(self: T) end
+
+        function T.Three(self: T, x)
+            self.Prop[x] = true
+        end
+
+        function T.Four(self: T, x)
+            print("", x)
+        end
+
+        function T.Five(self: T) end
+
+        function T.Six(self: T) end
+
+        function T.Seven(self: T) end
+
+        function T.Eight(self: T) end
+
+        function T.Nine(self: T) end
+
+        function T.Ten(self: T) end
+
+        function T.Eleven(self: T) end
+
+        function T.Twelve(self: T) end
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    LUAU_REQUIRE_ERROR(result, UnknownProperty);
+
+    // A sanity check to ensure that this statistic is being recorded at all.
+    CHECK(frontend->stats.dynamicConstraintsCreated > 10);
+
+    CHECK(frontend->stats.dynamicConstraintsCreated < 40);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "subtyping_should_cache_pairs_in_seen_set" * doctest::timeout(1.0))
+{
+    ScopedFastFlag sff{FFlag::LuauSolverV2, true};
+
+    constexpr const char* src = R"LUAU(
+    type DataProxy = any
+
+    type _Transaction = (c: _ApolloCache) -> ()
+    type _ApolloCache = {
+	    read: <T, TVariables>(self: _ApolloCache, query: Cache_ReadOptions<TVariables, T>) -> T | nil,
+	    write: <TResult, TVariables>(self: _ApolloCache, write: Cache_WriteOptions<TResult, TVariables>) -> Reference | nil,
+	    diff: <T>(self: _ApolloCache, query: Cache_DiffOptions) -> Cache_DiffResult<T>,
+	    watch: (self: _ApolloCache, watch: Cache_WatchOptions<Record<string, any>>) -> (),
+	    reset: (self: _ApolloCache) -> Promise<nil>,
+	    evict: (self: _ApolloCache, options: Cache_EvictOptions) -> boolean,
+	    restore: (self: _ApolloCache, serializedState: TSerialized_) -> _ApolloCache,
+	    extract: (self: _ApolloCache, optimistic: boolean?) -> any,
+	    removeOptimistic: (self: _ApolloCache, id: string) -> (),
+	    batch: (self: _ApolloCache, options: Cache_BatchOptions<_ApolloCache>) -> (),
+	    performTransaction: (self: _ApolloCache, transaction: _Transaction, optimisticId: string) -> (),
+	    recordOptimisticTransaction: (self: _ApolloCache, transaction: _Transaction, optimisticId: string) -> (),
+	    transformDocument: (self: _ApolloCache, document: DocumentNode) -> DocumentNode,
+	    identify: (self: _ApolloCache, object: StoreObject | Reference) -> string | nil,
+	    gc: (self: _ApolloCache) -> Array<string>,
+	    modify: (self: _ApolloCache, options: Cache_ModifyOptions) -> boolean,
+	    transformForLink: (self: _ApolloCache, document: DocumentNode) -> DocumentNode,
+	    readQuery: <QueryType, TVariables>(
+		    self: _ApolloCache,
+		    options: Cache_ReadQueryOptions<QueryType, TVariables>,
+		    optimistic: boolean?
+	    ) -> QueryType | nil,
+	    readFragment: <FragmentType, TVariables>(
+		    self: _ApolloCache,
+		    options: Cache_ReadFragmentOptions<FragmentType, TVariables>,
+		    optimistic: boolean?
+	    ) -> FragmentType | nil,
+	    writeQuery: <TData, TVariables>(self: _ApolloCache, Cache_WriteQueryOptions<TData, TVariables>) -> Reference | nil,
+	    writeFragment: <TData, TVariables>(
+		    self: _ApolloCache,
+		    Cache_WriteFragmentOptions<TData, TVariables>
+	    ) -> Reference | nil,
+    }
+
+    export type ApolloCache<TSerialized> = {
+	    -- something here needed
+	    read: <T, TVariables>(self: ApolloCache<TSerialized>, query: Cache_ReadOptions<TVariables, T>) -> T | nil,
+	    write: <TResult, TVariables>(
+		    self: ApolloCache<TSerialized>,
+		    write: Cache_WriteOptions<TResult, TVariables>
+	    ) -> Reference | nil,
+	    diff: <T>(self: ApolloCache<TSerialized>, query: Cache_DiffOptions) -> Cache_DiffResult<T>,
+	    watch: (self: ApolloCache<TSerialized>, watch: Cache_WatchOptions<Record<string, any>>) -> (() -> ()),
+	    reset: (self: ApolloCache<TSerialized>) -> Promise<nil>,
+	    evict: (self: ApolloCache<TSerialized>, options: Cache_EvictOptions) -> boolean,
+	    restore: (self: ApolloCache<TSerialized>, serializedState: TSerialized_) -> _ApolloCache,
+	    extract: (self: ApolloCache<TSerialized>, optimistic: boolean?) -> TSerialized,
+	    removeOptimistic: (self: ApolloCache<TSerialized>, id: string) -> (),
+	    batch: (self: ApolloCache<TSerialized>, options: Cache_BatchOptions<_ApolloCache>) -> (),
+	    performTransaction: (self: ApolloCache<TSerialized>, transaction: _Transaction, optimisticId: string) -> (),
+	    -- bottom text
+	    -- TOP
+	    recordOptimisticTransaction: (
+		    self: ApolloCache<TSerialized>,
+		    transaction: _Transaction,
+		    optimisticId: string
+	    ) -> (),
+	    transformDocument: (self: ApolloCache<TSerialized>, document: DocumentNode) -> DocumentNode,
+	    identify: (self: ApolloCache<TSerialized>, object: StoreObject | Reference) -> string | nil,
+	    gc: (self: ApolloCache<TSerialized>) -> Array<string>,
+	    modify: (self: ApolloCache<TSerialized>, options: Cache_ModifyOptions) -> boolean,
+	    -- BOTTOM
+
+	    transformForLink: (self: ApolloCache<TSerialized>, document: DocumentNode) -> DocumentNode,
+	    readQuery: <QueryType, TVariables>(
+		    self: ApolloCache<TSerialized>,
+		    options: Cache_ReadQueryOptions<QueryType, TVariables>,
+		    optimistic: boolean?
+	    ) -> QueryType | nil,
+	    readFragment: <FragmentType, TVariables>(
+		    self: ApolloCache<TSerialized>,
+		    options: Cache_ReadFragmentOptions<FragmentType, TVariables>,
+		    optimistic: boolean?
+	    ) -> FragmentType | nil,
+	    writeQuery: <TData, TVariables>(
+		    self: ApolloCache<TSerialized>,
+		    Cache_WriteQueryOptions<TData, TVariables>
+	    ) -> Reference | nil,
+	    writeFragment: <TData, TVariables>(
+		    self: ApolloCache<TSerialized>,
+		    Cache_WriteFragmentOptions<TData, TVariables>
+	    ) -> Reference | nil,
+    }
+
+
+    export type InMemoryCache = ApolloCache<NormalizedCacheObject> & {
+	    performTransaction: (
+		    self: InMemoryCache,
+		    update: (cache: InMemoryCache) -> ()
+	    ) -> ()
+    }
+
+    type InMemoryCachePrivate = InMemoryCache & {
+	    broadcastWatches: (self: InMemoryCachePrivate) -> (), -- ROBLOX NOTE: protected method
+    }
+
+    local InMemoryCache = {}
+    InMemoryCache.__index = InMemoryCache
+
+    -- InMemoryCache.batch = nil :: any
+    function InMemoryCache:batch()
+	    self = self :: InMemoryCachePrivate
+
+	    if self.txCount == 0 then
+		    self:broadcastWatches() --  problematic call?
+	    end
+    end
+    )LUAU";
+
+    std::ignore = check(src);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "test_generic_pruning_recursion_limit")
+{
+    ScopedFastFlag _{FFlag::LuauSolverV2, true};
+
+    ScopedFastInt sfi{FInt::LuauGenericCounterMaxSteps, 1};
+
+    LUAU_REQUIRE_NO_ERRORS(check(R"(
+        local function get(scale)
+            print(scale.Do.Re.Mi)
+        end
+    )"));
+    CHECK_EQ("<a>({ read Do: { read Re: { read Mi: a } } }) -> ()", toString(requireType("get")));
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "unification_runs_a_limited_number_of_iterations_before_stopping" * doctest::timeout(4.0))
+{
+    ScopedFastFlag sff[] = {
+        {FFlag::LuauSolverV2, true},
+    };
+
+    ScopedFastInt sfi{FInt::LuauTypeInferIterationLimit, 100};
+
+    CheckResult result = check(R"(
+        local function l0<A...>()
+            for l0=_,_ do
+            end
+        end
+
+        _ = if _._ then function(l0)
+        end elseif _._G then if `` then {n0=_,} else "luauExprConstantSt" elseif _[_][l0] then function()
+        end elseif _.n0 then if _[_] then if _ then _ else "aeld" elseif false then 0 else "lead"
+        return _.n0
+    )");
+
+    LUAU_REQUIRE_ERROR(result, UnificationTooComplex);
+}
+
+#if defined(_MSC_VER) || defined(__APPLE__)
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "native_stack_guard_prevents_stack_overflows" * doctest::timeout(4.0))
+{
+    ScopedFastFlag sff[] = {
+        {FFlag::LuauSolverV2, true},
+        {FFlag::LuauUseNativeStackGuard, true},
+    };
+
+    // Disable the iteration limit and very tightly constrain the stack.
+    ScopedFastInt sfi{FInt::LuauTypeInferIterationLimit, 0};
+    limitStackSize(38600);
+
+    try
+    {
+        (void)check(R"(
+            local function l0<A...>()
+                for l0=_,_ do
+                end
+            end
+
+            _ = if _._ then function(l0)
+            end elseif _._G then if `` then {n0=_,} else "luauExprConstantSt" elseif _[_][l0] then function()
+            end elseif _.n0 then if _[_] then if _ then _ else "aeld" elseif false then 0 else "lead"
+            return _.n0
+        )");
+    }
+    catch (InternalCompilerError& err)
+    {
+        // HACK: This test doesn't consistently stack overflow in the same subsystem because
+        // there is some other unrelated source of nondeterminism in the solver.
+        // For this test, it's aside from the point, so we write it to be a little bit flexible.
+        const std::string prefix = "Stack overflow in ";
+        CHECK(prefix == std::string(err.what()).substr(0, prefix.size()));
+        return;
+    }
+
+    CHECK_MESSAGE(false, "An expected InternalCompilerError was not thrown!");
+}
+
+#endif
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "fusion_normalization_spin" * doctest::timeout(1.0))
+{
+    LUAU_REQUIRE_ERRORS(check(R"(
+type Task = unknown
+type Constructors = unknown
+export type Scope<Constructors = any> = {Task} & Constructors
+export type DeriveScopeConstructor = (<S>(Scope<S>) -> Scope<S>)
+    & (<S, A>(Scope<S>, A & {}) -> Scope<S & A>)
+    & (<S, A, B>(Scope<S>, A & {}, B & {}) -> Scope<S & A & B>)
+    & (<S, A, B, C>(Scope<S>, A & {}, B & {}, C & {}) -> Scope<S & A & B & C>)
+    & (<S, A, B, C, D>(Scope<S>, A & {}, B & {}, C & {}, D & {}) -> Scope<S & A & B & C & D>)
+    & (<S, A, B, C, D, E>(Scope<S>, A & {}, B & {}, C & {}, D & {}, E & {}) -> Scope<S & A & B & C & D & E>)
+    & (<S, A, B, C, D, E, F>(Scope<S>, A & {}, B & {}, C & {}, D & {}, E & {}, F & {}) -> Scope<S & A & B & C & D & E & F>)
+    & (<S, A, B, C, D, E, F, G>(Scope<S>, A & {}, B & {}, C & {}, D & {}, E & {}, F & {}, G & {}) -> Scope<S & A & B & C & D & E & F & G>)
+    & (<S, A, B, C, D, E, F, G, H>(Scope<S>, A & {}, B & {}, C & {}, D & {}, E & {}, F & {}, G & {}, H & {}) -> Scope<S & A & B & C & D & E & F & G & H>)
+    & (<S, A, B, C, D, E, F, G, H, I>(Scope<S>, A & {}, B & {}, C & {}, D & {}, E & {}, F & {}, G & {}, H & {}, I & {}) -> Scope<S & A & B & C & D & E & F & G & H & I>)
+    & (<S, A, B, C, D, E, F, G, H, I, J>(Scope<S>, A & {}, B & {}, C & {}, D & {}, E & {}, F & {}, G & {}, H & {}, I & {}, J & {}) -> Scope<S & A & B & C & D & E & F & G & H & I & J>)
+    & (<S, A, B, C, D, E, F, G, H, I, J, K>(Scope<S>, A & {}, B & {}, C & {}, D & {}, E & {}, F & {}, G & {}, H & {}, I & {}, J & {}, K & {}) -> Scope<S & A & B & C & D & E & F & G & H & I & J & K>)
+    & (<S, A, B, C, D, E, F, G, H, I, J, K, L>(Scope<S>, A & {}, B & {}, C & {}, D & {}, E & {}, F & {}, G & {}, H & {}, I & {}, J & {}, K & {}, L & {}) -> Scope<S & A & B & C & D & E & F & G & H & I & J & K & L>)
+
+local deriveScopeImpl : DeriveScopeConstructor = (nil :: any)
+
+local function innerScope<T>(
+    existing: Types.Scope<T>,
+    ...: {[unknown]: unknown}
+): any
+    local new = deriveScopeImpl(existing, ...)
+end
+
+    )"));
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "fuzzer_stepwise_normalization_works" * doctest::timeout(4.0))
+{
+    LUAU_REQUIRE_ERRORS(check(R"(
+        _ = if _ then {n0=# _,[_]=_,``,[function(l0,l0,l0)
+        do end
+        end]=_,setmetatable,[l0(_ + _)]=_,} else _(),_,_
+        _[_](_,_(coroutine,_,_,nil),_(0,_()),function()
+        end)
+    )"));
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "fuzzer_oom_unions" * doctest::timeout(4.0))
+{
+    LUAU_REQUIRE_ERRORS(check(R"(
+        local _ = true,l0
+        _ = if _ then _ else _._,if _[_] then nil elseif _ then `` else _._,...
+        _ = if _ then _ elseif _ then `` else _.n0,true,...
+        _G = if "" then _ else _.n0,_
+        _ = if _[_] then _ elseif _ then _ + n0 else _._,32804,...
+        _.readstring = _,_
+        local l0 = require(module0)
+        _ = _,l0,_
+        do end
+        _.readstring += _
+    )"));
 }
 
 TEST_SUITE_END();

@@ -72,14 +72,12 @@ enum lua_Type
     LUA_TNIL = 0,     // must be 0 due to lua_isnoneornil
     LUA_TBOOLEAN = 1, // must be 1 due to l_isfalse
 
-
     LUA_TLIGHTUSERDATA,
     LUA_TNUMBER,
     LUA_TVECTOR,
 	LUA_TCOLOR,
 
     LUA_TSTRING, // all types above this must be value types, all types below this must be GC types - see iscollectable
-
 
     LUA_TTABLE,
     LUA_TFUNCTION,
@@ -158,6 +156,7 @@ LUA_API int lua_tocolorf(lua_State* L, int idx, float *color, int acceptNumber);
 LUA_API int lua_toboolean(lua_State* L, int idx);
 LUA_API const char* lua_tolstring(lua_State* L, int idx, size_t* len);
 LUA_API const char* lua_tostringatom(lua_State* L, int idx, int* atom);
+LUA_API const char* lua_tolstringatom(lua_State* L, int idx, size_t* len, int* atom);
 LUA_API const char* lua_namecallatom(lua_State* L, int* atom);
 LUA_API int lua_objlen(lua_State* L, int idx);
 LUA_API lua_CFunction lua_tocfunction(lua_State* L, int idx);
@@ -194,6 +193,7 @@ LUA_API int lua_pushthread(lua_State* L);
 
 LUA_API void lua_pushlightuserdatatagged(lua_State* L, void* p, int tag);
 LUA_API void* lua_newuserdatatagged(lua_State* L, size_t sz, int tag);
+LUA_API void* lua_newuserdatataggedwithmetatable(lua_State* L, size_t sz, int tag); // metatable fetched with lua_getuserdatametatable
 LUA_API void* lua_newuserdatadtor(lua_State* L, size_t sz, void (*dtor)(void*));
 
 LUA_API void* lua_newbuffer(lua_State* L, size_t sz);
@@ -206,6 +206,7 @@ LUA_API int lua_getfield(lua_State* L, int idx, const char* k);
 LUA_API int lua_rawgetfield(lua_State* L, int idx, const char* k);
 LUA_API int lua_rawget(lua_State* L, int idx);
 LUA_API int lua_rawgeti(lua_State* L, int idx, int n);
+LUA_API int lua_rawgetptagged(lua_State* L, int idx, void* p, int tag);
 LUA_API void lua_createtable(lua_State* L, int narr, int nrec);
 
 LUA_API void lua_setreadonly(lua_State* L, int idx, int enabled);
@@ -223,6 +224,7 @@ LUA_API void lua_setfield(lua_State* L, int idx, const char* k);
 LUA_API void lua_rawsetfield(lua_State* L, int idx, const char* k);
 LUA_API void lua_rawset(lua_State* L, int idx);
 LUA_API void lua_rawseti(lua_State* L, int idx, int n);
+LUA_API void lua_rawsetptagged(lua_State* L, int idx, void* p, int tag);
 LUA_API int lua_setmetatable(lua_State* L, int objindex);
 LUA_API int lua_setfenv(lua_State* L, int idx);
 
@@ -232,6 +234,7 @@ LUA_API int lua_setfenv(lua_State* L, int idx);
 LUA_API int luau_load(lua_State* L, const char* chunkname, const char* data, size_t size, int env);
 LUA_API void lua_call(lua_State* L, int nargs, int nresults);
 LUA_API int lua_pcall(lua_State* L, int nargs, int nresults, int errfunc);
+LUA_API int lua_cpcall(lua_State* L, lua_CFunction func, void* ud);
 
 /*
 ** coroutine functions
@@ -335,7 +338,8 @@ LUA_API void lua_setuserdatadtor(lua_State* L, int tag, lua_Destructor dtor);
 LUA_API lua_Destructor lua_getuserdatadtor(lua_State* L, int tag);
 
 // alternative access for metatables already registered with luaL_newmetatable
-LUA_API void lua_setuserdatametatable(lua_State* L, int tag, int idx);
+// used by lua_newuserdatataggedwithmetatable to create tagged userdata with the associated metatable assigned
+LUA_API void lua_setuserdatametatable(lua_State* L, int tag);
 LUA_API void lua_getuserdatametatable(lua_State* L, int tag);
 
 LUA_API void lua_setlightuserdataname(lua_State* L, int tag, const char* name);
@@ -344,6 +348,7 @@ LUA_API const char* lua_getlightuserdataname(lua_State* L, int tag);
 LUA_API void lua_clonefunction(lua_State* L, int idx);
 
 LUA_API void lua_cleartable(lua_State* L, int idx);
+LUA_API void lua_clonetable(lua_State* L, int idx);
 
 LUA_API lua_Alloc lua_getallocf(lua_State* L, void** ud);
 
@@ -389,6 +394,9 @@ LUA_API void lua_unref(lua_State* L, int ref);
 #define lua_pushcfunction(L, fn, debugname) lua_pushcclosurek(L, fn, debugname, 0, NULL)
 #define lua_pushcclosure(L, fn, debugname, nup) lua_pushcclosurek(L, fn, debugname, nup, NULL)
 #define lua_pushlightuserdata(L, p) lua_pushlightuserdatatagged(L, p, 0)
+
+#define lua_rawgetp(L, idx, p) lua_rawgetptagged(L, idx, p, 0)
+#define lua_rawsetp(L, idx, p) lua_rawsetptagged(L, idx, p, 0)
 
 #define lua_setglobal(L, s) lua_setfield(L, LUA_GLOBALSINDEX, (s))
 #define lua_getglobal(L, s) lua_getfield(L, LUA_GLOBALSINDEX, (s))

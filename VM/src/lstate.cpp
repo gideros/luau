@@ -10,6 +10,8 @@
 #include "ldo.h"
 #include "ldebug.h"
 
+#include <string.h>
+
 /*
 ** Main thread combines a thread state and the global state
 */
@@ -158,7 +160,7 @@ void lua_resetthread(lua_State* L)
     L->nCcalls = L->baseCcalls = 0;
     // clear thread stack
     if (L->stacksize != BASIC_STACK_SIZE + EXTRA_STACK)
-        luaD_reallocstack(L, BASIC_STACK_SIZE);
+        luaD_reallocstack(L, BASIC_STACK_SIZE, 0);
     for (int i = 0; i < L->stacksize; i++)
         setnilvalue(L->stack + i);
 }
@@ -234,6 +236,8 @@ lua_State* lua_newstate(lua_Alloc f, void* ud)
 
     g->ecb = lua_ExecutionCallbacks();
 
+    memset(g->ecbdata, 0, LUA_EXECUTION_CALLBACK_STORAGE * sizeof(g->ecbdata[0]));
+
     g->gcstats = GCStats();
     g->printfunc = NULL;
     g->printfuncdata = NULL;
@@ -284,17 +288,17 @@ LUA_API int lua_isclosing(lua_State *L)
 	return L->global->closing;
 }
 
-void lua_profileTableAllocation(lua_State *L,Table *t,const uint32_t *pc)
+void lua_profileTableAllocation(lua_State *L,LuaTable *t,const uint32_t *pc)
 {
     if (!lua_checkstack(L,3)) return;
     lua_getglobal(L,"__tableAllocationProfiler__");
     if (lua_isnil(L,-1)) {
-        Table *tnew = luaH_new(L, 0, 0);
+    	LuaTable *tnew = luaH_new(L, 0, 0);
         sethvalue(L, L->top-1, tnew);
         sethvalue(L, L->top, tnew);
         L->top++;
         lua_setglobal(L,"__tableAllocationProfiler__");
-        Table *tmeta = luaH_new(L, 0, 0);
+        LuaTable *tmeta = luaH_new(L, 0, 0);
         sethvalue(L, L->top, tmeta);
         L->top++;
         lua_pushstring(L, "k");                             // t mt v

@@ -6,6 +6,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 
+LUAU_FASTFLAG(LuauCodegenBufferLoadProp2)
+
 namespace Luau
 {
 namespace CodeGen
@@ -37,7 +39,8 @@ static_assert(sizeof(cmovTextForCondition) / sizeof(cmovTextForCondition[0]) == 
 #define OP_PLUS_CC(op, cc) ((op) + uint8_t(cc))
 
 #define REX_W_BIT(value) (value ? 0x8 : 0x0)
-#define REX_W(reg) REX_W_BIT((reg).size == SizeX64::qword || ((reg).size == SizeX64::byte && (reg).index >= 4))
+#define REX_W(reg) REX_W_BIT((reg).size == SizeX64::qword)
+#define REX_FORCE(reg) (((reg).size == SizeX64::byte && (reg).index >= 4) ? 0x40 : 0x00)
 #define REX_R(reg) (((reg).index & 0x8) >> 1)
 #define REX_X(reg) (((reg).index & 0x8) >> 2)
 #define REX_B(reg) (((reg).index & 0x8) >> 3)
@@ -77,9 +80,10 @@ static ABIX64 getCurrentX64ABI()
 #endif
 }
 
-AssemblyBuilderX64::AssemblyBuilderX64(bool logText, ABIX64 abi)
+AssemblyBuilderX64::AssemblyBuilderX64(bool logText, ABIX64 abi, unsigned int features)
     : logText(logText)
     , abi(abi)
+    , features(features)
     , constCache32(~0u)
     , constCache64(~0ull)
 {
@@ -91,8 +95,8 @@ AssemblyBuilderX64::AssemblyBuilderX64(bool logText, ABIX64 abi)
     codeEnd = code.data() + code.size();
 }
 
-AssemblyBuilderX64::AssemblyBuilderX64(bool logText)
-    : AssemblyBuilderX64(logText, getCurrentX64ABI())
+AssemblyBuilderX64::AssemblyBuilderX64(bool logText, unsigned int features)
+    : AssemblyBuilderX64(logText, getCurrentX64ABI(), features)
 {
 }
 
@@ -262,13 +266,27 @@ void AssemblyBuilderX64::movsx(RegisterX64 lhs, OperandX64 rhs)
     if (logText)
         log("movsx", lhs, rhs);
 
-    CODEGEN_ASSERT(rhs.memSize == SizeX64::byte || rhs.memSize == SizeX64::word);
+    if (FFlag::LuauCodegenBufferLoadProp2)
+    {
+        SizeX64 size = rhs.cat == CategoryX64::reg ? rhs.base.size : rhs.memSize;
+        CODEGEN_ASSERT(size == SizeX64::byte || size == SizeX64::word);
 
-    placeRex(lhs, rhs);
-    place(0x0f);
-    place(rhs.memSize == SizeX64::byte ? 0xbe : 0xbf);
-    placeRegAndModRegMem(lhs, rhs);
-    commit();
+        placeRex(lhs, rhs);
+        place(0x0f);
+        place(size == SizeX64::byte ? 0xbe : 0xbf);
+        placeRegAndModRegMem(lhs, rhs);
+        commit();
+    }
+    else
+    {
+        CODEGEN_ASSERT(rhs.memSize == SizeX64::byte || rhs.memSize == SizeX64::word);
+
+        placeRex(lhs, rhs);
+        place(0x0f);
+        place(rhs.memSize == SizeX64::byte ? 0xbe : 0xbf);
+        placeRegAndModRegMem(lhs, rhs);
+        commit();
+    }
 }
 
 void AssemblyBuilderX64::movzx(RegisterX64 lhs, OperandX64 rhs)
@@ -276,13 +294,27 @@ void AssemblyBuilderX64::movzx(RegisterX64 lhs, OperandX64 rhs)
     if (logText)
         log("movzx", lhs, rhs);
 
-    CODEGEN_ASSERT(rhs.memSize == SizeX64::byte || rhs.memSize == SizeX64::word);
+    if (FFlag::LuauCodegenBufferLoadProp2)
+    {
+        SizeX64 size = rhs.cat == CategoryX64::reg ? rhs.base.size : rhs.memSize;
+        CODEGEN_ASSERT(size == SizeX64::byte || size == SizeX64::word);
 
-    placeRex(lhs, rhs);
-    place(0x0f);
-    place(rhs.memSize == SizeX64::byte ? 0xb6 : 0xb7);
-    placeRegAndModRegMem(lhs, rhs);
-    commit();
+        placeRex(lhs, rhs);
+        place(0x0f);
+        place(size == SizeX64::byte ? 0xb6 : 0xb7);
+        placeRegAndModRegMem(lhs, rhs);
+        commit();
+    }
+    else
+    {
+        CODEGEN_ASSERT(rhs.memSize == SizeX64::byte || rhs.memSize == SizeX64::word);
+
+        placeRex(lhs, rhs);
+        place(0x0f);
+        place(rhs.memSize == SizeX64::byte ? 0xb6 : 0xb7);
+        placeRegAndModRegMem(lhs, rhs);
+        commit();
+    }
 }
 
 void AssemblyBuilderX64::div(OperandX64 op)
@@ -740,6 +772,11 @@ void AssemblyBuilderX64::vsubsd(OperandX64 dst, OperandX64 src1, OperandX64 src2
     placeAvx("vsubsd", dst, src1, src2, 0x5c, false, AVX_0F, AVX_F2);
 }
 
+void AssemblyBuilderX64::vsubss(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vsubss", dst, src1, src2, 0x5c, false, AVX_0F, AVX_F3);
+}
+
 void AssemblyBuilderX64::vsubps(OperandX64 dst, OperandX64 src1, OperandX64 src2)
 {
     placeAvx("vsubps", dst, src1, src2, 0x5c, false, AVX_0F, AVX_NP);
@@ -750,6 +787,11 @@ void AssemblyBuilderX64::vmulsd(OperandX64 dst, OperandX64 src1, OperandX64 src2
     placeAvx("vmulsd", dst, src1, src2, 0x59, false, AVX_0F, AVX_F2);
 }
 
+void AssemblyBuilderX64::vmulss(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vmulss", dst, src1, src2, 0x59, false, AVX_0F, AVX_F3);
+}
+
 void AssemblyBuilderX64::vmulps(OperandX64 dst, OperandX64 src1, OperandX64 src2)
 {
     placeAvx("vmulps", dst, src1, src2, 0x59, false, AVX_0F, AVX_NP);
@@ -758,6 +800,11 @@ void AssemblyBuilderX64::vmulps(OperandX64 dst, OperandX64 src1, OperandX64 src2
 void AssemblyBuilderX64::vdivsd(OperandX64 dst, OperandX64 src1, OperandX64 src2)
 {
     placeAvx("vdivsd", dst, src1, src2, 0x5e, false, AVX_0F, AVX_F2);
+}
+
+void AssemblyBuilderX64::vdivss(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vdivss", dst, src1, src2, 0x5e, false, AVX_0F, AVX_F3);
 }
 
 void AssemblyBuilderX64::vdivps(OperandX64 dst, OperandX64 src1, OperandX64 src2)
@@ -780,6 +827,11 @@ void AssemblyBuilderX64::vandnpd(OperandX64 dst, OperandX64 src1, OperandX64 src
     placeAvx("vandnpd", dst, src1, src2, 0x55, false, AVX_0F, AVX_66);
 }
 
+void AssemblyBuilderX64::vxorps(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vxorps", dst, src1, src2, 0x57, false, AVX_0F, AVX_NP);
+}
+
 void AssemblyBuilderX64::vxorpd(OperandX64 dst, OperandX64 src1, OperandX64 src2)
 {
     placeAvx("vxorpd", dst, src1, src2, 0x57, false, AVX_0F, AVX_66);
@@ -800,6 +852,11 @@ void AssemblyBuilderX64::vucomisd(OperandX64 src1, OperandX64 src2)
     placeAvx("vucomisd", src1, src2, 0x2e, false, AVX_0F, AVX_66);
 }
 
+void AssemblyBuilderX64::vucomiss(OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vucomiss", src1, src2, 0x2e, false, AVX_0F, AVX_NP);
+}
+
 void AssemblyBuilderX64::vcvttsd2si(OperandX64 dst, OperandX64 src)
 {
     placeAvx("vcvttsd2si", dst, src, 0x2c, dst.base.size == SizeX64::qword, AVX_0F, AVX_F2);
@@ -808,6 +865,11 @@ void AssemblyBuilderX64::vcvttsd2si(OperandX64 dst, OperandX64 src)
 void AssemblyBuilderX64::vcvtsi2sd(OperandX64 dst, OperandX64 src1, OperandX64 src2)
 {
     placeAvx("vcvtsi2sd", dst, src1, src2, 0x2a, (src2.cat == CategoryX64::reg ? src2.base.size : src2.memSize) == SizeX64::qword, AVX_0F, AVX_F2);
+}
+
+void AssemblyBuilderX64::vcvtsi2ss(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vcvtsi2ss", dst, src1, src2, 0x2a, (src2.cat == CategoryX64::reg ? src2.base.size : src2.memSize) == SizeX64::qword, AVX_0F, AVX_F3);
 }
 
 void AssemblyBuilderX64::vcvtsd2ss(OperandX64 dst, OperandX64 src1, OperandX64 src2)
@@ -833,6 +895,25 @@ void AssemblyBuilderX64::vcvtss2sd(OperandX64 dst, OperandX64 src1, OperandX64 s
 void AssemblyBuilderX64::vroundsd(OperandX64 dst, OperandX64 src1, OperandX64 src2, RoundingModeX64 roundingMode)
 {
     placeAvx("vroundsd", dst, src1, src2, uint8_t(roundingMode) | kRoundingPrecisionInexact, 0x0b, false, AVX_0F3A, AVX_66);
+}
+
+void AssemblyBuilderX64::vroundss(OperandX64 dst, OperandX64 src1, OperandX64 src2, RoundingModeX64 roundingMode)
+{
+    placeAvx("vroundss", dst, src1, src2, uint8_t(roundingMode) | kRoundingPrecisionInexact, 0x0a, false, AVX_0F3A, AVX_66);
+}
+
+void AssemblyBuilderX64::vroundps(OperandX64 dst, OperandX64 src, RoundingModeX64 roundingMode)
+{
+    // 'placeAvx' wrapper doesn't have an overload for this archetype (opcode r/m, reg, imm8)
+    if (logText)
+        log("vroundps", dst, src, uint8_t(roundingMode) | kRoundingPrecisionInexact);
+
+    placeVex(dst, noreg, src, false, AVX_0F3A, AVX_66);
+    place(0x08);
+    placeRegAndModRegMem(dst, src, /*extraCodeBytes=*/1);
+    placeImm8(uint8_t(roundingMode) | kRoundingPrecisionInexact);
+
+    commit();
 }
 
 void AssemblyBuilderX64::vsqrtpd(OperandX64 dst, OperandX64 src)
@@ -920,9 +1001,24 @@ void AssemblyBuilderX64::vmaxsd(OperandX64 dst, OperandX64 src1, OperandX64 src2
     placeAvx("vmaxsd", dst, src1, src2, 0x5f, false, AVX_0F, AVX_F2);
 }
 
+void AssemblyBuilderX64::vmaxss(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vmaxss", dst, src1, src2, 0x5f, false, AVX_0F, AVX_F3);
+}
+
 void AssemblyBuilderX64::vminsd(OperandX64 dst, OperandX64 src1, OperandX64 src2)
 {
     placeAvx("vminsd", dst, src1, src2, 0x5d, false, AVX_0F, AVX_F2);
+}
+
+void AssemblyBuilderX64::vminss(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vminss", dst, src1, src2, 0x5d, false, AVX_0F, AVX_F3);
+}
+
+void AssemblyBuilderX64::vcmpeqsd(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vcmpeqsd", dst, src1, src2, 0x00, 0xc2, false, AVX_0F, AVX_F2);
 }
 
 void AssemblyBuilderX64::vcmpltsd(OperandX64 dst, OperandX64 src1, OperandX64 src2)
@@ -930,10 +1026,26 @@ void AssemblyBuilderX64::vcmpltsd(OperandX64 dst, OperandX64 src1, OperandX64 sr
     placeAvx("vcmpltsd", dst, src1, src2, 0x01, 0xc2, false, AVX_0F, AVX_F2);
 }
 
-void AssemblyBuilderX64::vblendvpd(RegisterX64 dst, RegisterX64 src1, OperandX64 mask, RegisterX64 src3)
+void AssemblyBuilderX64::vcmpltss(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vcmpltss", dst, src1, src2, 0x01, 0xc2, false, AVX_0F, AVX_F3);
+}
+
+void AssemblyBuilderX64::vcmpeqps(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vcmpeqps", dst, src1, src2, 0x00, 0xc2, false, AVX_0F, AVX_NP);
+}
+
+void AssemblyBuilderX64::vblendvps(RegisterX64 dst, RegisterX64 src1, OperandX64 src2, RegisterX64 mask)
 {
     // bits [7:4] of imm8 are used to select register for operand 4
-    placeAvx("vblendvpd", dst, src1, mask, src3.index << 4, 0x4b, false, AVX_0F3A, AVX_66);
+    placeAvx("vblendvps", dst, src1, src2, mask.index << 4, 0x4a, false, AVX_0F3A, AVX_66);
+}
+
+void AssemblyBuilderX64::vblendvpd(RegisterX64 dst, RegisterX64 src1, OperandX64 src2, RegisterX64 mask)
+{
+    // bits [7:4] of imm8 are used to select register for operand 4
+    placeAvx("vblendvpd", dst, src1, src2, mask.index << 4, 0x4b, false, AVX_0F3A, AVX_66);
 }
 
 void AssemblyBuilderX64::vpshufps(RegisterX64 dst, RegisterX64 src1, OperandX64 src2, uint8_t shuffle)
@@ -944,6 +1056,35 @@ void AssemblyBuilderX64::vpshufps(RegisterX64 dst, RegisterX64 src1, OperandX64 
 void AssemblyBuilderX64::vpinsrd(RegisterX64 dst, RegisterX64 src1, OperandX64 src2, uint8_t offset)
 {
     placeAvx("vpinsrd", dst, src1, src2, offset, 0x22, false, AVX_0F3A, AVX_66);
+}
+
+void AssemblyBuilderX64::vpextrd(RegisterX64 dst, RegisterX64 src, uint8_t offset)
+{
+    // 'placeAvx' wrapper doesn't have an overload for this archetype (opcode r/m, reg, imm8)
+    if (logText)
+        log("vpextrd", dst, src, offset);
+
+    placeVex(src, noreg, dst, false, AVX_0F3A, AVX_66);
+    place(0x16);
+    placeRegAndModRegMem(src, dst, /*extraCodeBytes=*/1);
+    placeImm8(offset);
+
+    commit();
+}
+
+void AssemblyBuilderX64::vdpps(OperandX64 dst, OperandX64 src1, OperandX64 src2, uint8_t mask)
+{
+    placeAvx("vdpps", dst, src1, src2, mask, 0x40, false, AVX_0F3A, AVX_66);
+}
+
+void AssemblyBuilderX64::vfmadd213ps(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vfmadd213ps", dst, src1, src2, 0xA8, false, AVX_0F38, AVX_66);
+}
+
+void AssemblyBuilderX64::vfmadd213pd(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vfmadd213pd", dst, src1, src2, 0xA8, true, AVX_0F38, AVX_66);
 }
 
 bool AssemblyBuilderX64::finalize()
@@ -1314,7 +1455,10 @@ void AssemblyBuilderX64::placeAvx(
     uint8_t prefix
 )
 {
-    CODEGEN_ASSERT((dst.cat == CategoryX64::mem && src.cat == CategoryX64::reg) || (dst.cat == CategoryX64::reg && src.cat == CategoryX64::mem));
+    CODEGEN_ASSERT(
+        (dst.cat == CategoryX64::mem && src.cat == CategoryX64::reg) || (dst.cat == CategoryX64::reg && src.cat == CategoryX64::mem) ||
+        (dst.cat == CategoryX64::reg && src.cat == CategoryX64::reg)
+    );
 
     if (logText)
         log(name, dst, src);
@@ -1368,7 +1512,12 @@ void AssemblyBuilderX64::
     CODEGEN_ASSERT(src2.cat == CategoryX64::reg || src2.cat == CategoryX64::mem);
 
     if (logText)
-        log(name, dst, src1, src2, imm8);
+    {
+        if (src1.base == noreg)
+            log(name, src2, dst, imm8);
+        else
+            log(name, dst, src1, src2, imm8);
+    }
 
     placeVex(dst, src1, src2, setW, mode, prefix);
     place(code);
@@ -1380,7 +1529,7 @@ void AssemblyBuilderX64::
 
 void AssemblyBuilderX64::placeRex(RegisterX64 op)
 {
-    uint8_t code = REX_W(op) | REX_B(op);
+    uint8_t code = REX_W(op) | REX_B(op) | REX_FORCE(op);
 
     if (code != 0)
         place(code | 0x40);
@@ -1391,7 +1540,7 @@ void AssemblyBuilderX64::placeRex(OperandX64 op)
     uint8_t code = 0;
 
     if (op.cat == CategoryX64::reg)
-        code = REX_W(op.base) | REX_B(op.base);
+        code = REX_W(op.base) | REX_B(op.base) | REX_FORCE(op.base);
     else if (op.cat == CategoryX64::mem)
         code = REX_W_BIT(op.memSize == SizeX64::qword) | REX_X(op.index) | REX_B(op.base);
     else
@@ -1418,12 +1567,12 @@ void AssemblyBuilderX64::placeRexNoW(OperandX64 op)
 
 void AssemblyBuilderX64::placeRex(RegisterX64 lhs, OperandX64 rhs)
 {
-    uint8_t code = REX_W(lhs);
+    uint8_t code = REX_W(lhs) | REX_FORCE(lhs);
 
     if (rhs.cat == CategoryX64::imm)
         code |= REX_B(lhs);
     else
-        code |= REX_R(lhs) | REX_X(rhs.index) | REX_B(rhs.base);
+        code |= REX_R(lhs) | REX_X(rhs.index) | REX_B(rhs.base) | REX_FORCE(lhs) | REX_FORCE(rhs.base);
 
     if (code != 0)
         place(code | 0x40);

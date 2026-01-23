@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <string.h>
 
+LUAU_FASTFLAG(LuauCompileStringCharSubFold)
+LUAU_FASTFLAG(LuauCompileCallCostModel)
+
 namespace Luau
 {
 
@@ -488,6 +491,16 @@ void BytecodeBuilder::emitAux(uint32_t aux)
     lines.push_back(debugLine);
 }
 
+void BytecodeBuilder::undoEmit(LuauOpcode op)
+{
+    LUAU_ASSERT(FFlag::LuauCompileCallCostModel);
+    LUAU_ASSERT(!insns.empty());
+    LUAU_ASSERT((insns.back() & 0xff) == op);
+
+    insns.pop_back();
+    lines.pop_back();
+}
+
 size_t BytecodeBuilder::emitLabel()
 {
     return insns.size();
@@ -702,8 +715,11 @@ void BytecodeBuilder::finalize()
         // Write the mapping between used type name indices and their name
         for (uint32_t i = 0; i < uint32_t(userdataTypes.size()); i++)
         {
-            writeByte(bytecode, i + 1);
-            writeVarInt(bytecode, userdataTypes[i].nameRef);
+            if (userdataTypes[i].used)
+            {
+                writeByte(bytecode, i + 1);
+                writeVarInt(bytecode, userdataTypes[i].nameRef);
+            }
         }
 
         // 0 marks the end of the mapping
@@ -1774,7 +1790,8 @@ void BytecodeBuilder::validateVariadic() const
             // variadic sequence since they are never executed if FASTCALL does anything, so it's okay to skip their validation until CALL
             // (we can't simply start a variadic sequence here because that would trigger assertions during linked CALL validation)
         }
-        else if (op == LOP_CLOSEUPVALS || op == LOP_NAMECALL || op == LOP_GETIMPORT || op == LOP_MOVE || op == LOP_GETUPVAL || op == LOP_GETGLOBAL || op == LOP_GETTABLEKS || op == LOP_COVERAGE)
+        else if (op == LOP_CLOSEUPVALS || op == LOP_NAMECALL || op == LOP_GETIMPORT || op == LOP_MOVE || op == LOP_GETUPVAL || op == LOP_GETGLOBAL ||
+                 op == LOP_GETTABLEKS || op == LOP_COVERAGE)
         {
             // instructions inside a variadic sequence must be neutral (can't change L->top)
             // while there are many neutral instructions like this, here we check that the instruction is one of the few
@@ -1837,6 +1854,23 @@ void BytecodeBuilder::dumpConstant(std::string& result, int k) const
                 formatAppend(result, "'%.*s'", int(str.length), str.data);
             else
                 formatAppend(result, "'%.*s'...", 32, str.data);
+        }
+        else if (FFlag::LuauCompileStringCharSubFold)
+        {
+            formatAppend(result, "'");
+
+            for (size_t i = 0; i < str.length && i < 32; ++i)
+            {
+                if (unsigned(str.data[i]) < ' ')
+                    formatAppend(result, "\\x%02X", uint8_t(str.data[i]));
+                else
+                    formatAppend(result, "%c", str.data[i]);
+            }
+
+            if (str.length >= 32)
+                formatAppend(result, "'...");
+            else
+                formatAppend(result, "'");
         }
         break;
     }

@@ -3,6 +3,8 @@
 #include "Luau/BytecodeBuilder.h"
 #include "Luau/StringUtils.h"
 
+#include "luacode.h"
+
 #include "ScopedFlags.h"
 
 #include "doctest.h"
@@ -21,21 +23,66 @@ LUAU_FASTINT(LuauCompileInlineThresholdMaxBoost)
 LUAU_FASTINT(LuauCompileLoopUnrollThreshold)
 LUAU_FASTINT(LuauCompileLoopUnrollThresholdMaxBoost)
 LUAU_FASTINT(LuauRecursionLimit)
-LUAU_FASTFLAG(LuauUserDefinedTypeFunctionsSyntax2)
+LUAU_FASTFLAG(LuauCompileStringCharSubFold)
+LUAU_FASTFLAG(LuauCompileMathIsNanInfFinite)
+LUAU_FASTFLAG(LuauCompileCallCostModel)
+LUAU_FASTFLAG(LuauCompileInlineInitializers)
 
 using namespace Luau;
 
-static std::string compileFunction(const char* source, uint32_t id, int optimizationLevel = 1, bool enableVectors = false)
+static void luauLibraryConstantLookup(const char* library, const char* member, Luau::CompileConstant* constant)
+{
+    // While 'vector' is built-in, because of LUA_VECTOR_SIZE VM configuration, compiler cannot provide the right default by itself
+    if (strcmp(library, "vector") == 0)
+    {
+        if (strcmp(member, "zero") == 0)
+            return Luau::setCompileConstantVector(constant, 0.0f, 0.0f, 0.0f, 0.0f);
+
+        if (strcmp(member, "one") == 0)
+            return Luau::setCompileConstantVector(constant, 1.0f, 1.0f, 1.0f, 0.0f);
+    }
+
+    if (strcmp(library, "Vector3") == 0)
+    {
+        if (strcmp(member, "one") == 0)
+            return Luau::setCompileConstantVector(constant, 1.0f, 1.0f, 1.0f, 0.0f);
+
+        if (strcmp(member, "xAxis") == 0)
+            return Luau::setCompileConstantVector(constant, 1.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    if (strcmp(library, "test") == 0)
+    {
+        if (strcmp(member, "some_nil") == 0)
+            return Luau::setCompileConstantNil(constant);
+
+        if (strcmp(member, "some_boolean") == 0)
+            return Luau::setCompileConstantBoolean(constant, true);
+
+        if (strcmp(member, "some_number") == 0)
+            return Luau::setCompileConstantNumber(constant, 4.75);
+
+        if (strcmp(member, "some_string") == 0)
+            return Luau::setCompileConstantString(constant, "test", 4);
+    }
+}
+
+static std::string compileFunction(const char* source, uint32_t id, int optimizationLevel = 1, int typeInfoLevel = 0)
 {
     Luau::BytecodeBuilder bcb;
     bcb.setDumpFlags(Luau::BytecodeBuilder::Dump_Code);
+
     Luau::CompileOptions options;
     options.optimizationLevel = optimizationLevel;
-    if (enableVectors)
-    {
-        options.vectorLib = "Vector3";
-        options.vectorCtor = "new";
-    }
+    options.typeInfoLevel = typeInfoLevel;
+    options.vectorLib = "Vector3";
+    options.vectorCtor = "new";
+
+    static const char* kLibrariesWithConstants[] = {"vector", "Vector3", "test", nullptr};
+    options.librariesWithKnownMembers = kLibrariesWithConstants;
+
+    options.libraryMemberConstantCb = luauLibraryConstantLookup;
+
     Luau::compileOrThrow(bcb, source, options);
 
     return bcb.dumpFunction(id);
@@ -75,6 +122,70 @@ static std::string compileTypeTable(const char* source)
     return bcb.dumpTypeInfo();
 }
 
+static std::string compileWithRemarks(const char* source)
+{
+    Luau::BytecodeBuilder bcb;
+    bcb.setDumpFlags(Luau::BytecodeBuilder::Dump_Source | Luau::BytecodeBuilder::Dump_Remarks);
+    bcb.setDumpSource(source);
+
+    Luau::CompileOptions options;
+    options.optimizationLevel = 2;
+
+    Luau::compileOrThrow(bcb, source, options);
+
+    return bcb.dumpSourceRemarks();
+}
+
+struct RecursionLimitFixture
+{
+    void checkLimit(const std::string& code, const std::string& message)
+    {
+        if (findLimit)
+        {
+            for (int limit = 100; limit < reps; limit += 10)
+            {
+                ScopedFastInt flag{FInt::LuauRecursionLimit, limit};
+
+                try
+                {
+                    Luau::compileOrThrow(bcb, code);
+                }
+                catch (std::exception& e)
+                {
+                    if (e.what() != message)
+                    {
+                        MESSAGE("Exception with wrong message at depth of ", limit);
+                        break;
+                    }
+                }
+                catch (...)
+                {
+                    MESSAGE("Limit at depth of ", limit);
+                    break;
+                }
+            }
+        }
+        else
+        {
+            CHECK_THROWS_AS_MESSAGE(Luau::compileOrThrow(bcb, code), std::exception, message);
+        }
+    }
+
+    // The test forcibly pushes the stack limit during compilation; in NoOpt, the stack consumption is much larger so we need to reduce the limit to
+    // not overflow the C stack. When ASAN is enabled, stack consumption increases even more.
+#if defined(LUAU_ENABLE_ASAN)
+    ScopedFastInt flag{FInt::LuauRecursionLimit, 200};
+#elif defined(_NOOPT) || defined(_DEBUG)
+    ScopedFastInt flag{FInt::LuauRecursionLimit, 300};
+#endif
+
+    Luau::BytecodeBuilder bcb;
+    int reps = 1500;
+
+    // Use in a test to find what the current limit is (increase reps if it's higher than the default value)
+    bool findLimit = false;
+};
+
 TEST_SUITE_BEGIN("Compiler");
 
 TEST_CASE("BytecodeIsStable")
@@ -94,6 +205,8 @@ TEST_CASE("BytecodeIsStable")
     // Note: these aren't strictly bound to specific bytecode versions, but must monotonically increase to keep backwards compat
     CHECK(LBF_VECTOR == 54);
     CHECK(LBF_TOSTRING == 63);
+    CHECK(LBF_BUFFER_WRITEF64 == 77);
+    CHECK(LBF_VECTOR_MAX == 88);
 
     // Bytecode capture type (serialized & in-memory)
     CHECK(LCT_UPVAL == 2); // bytecode v1
@@ -298,28 +411,31 @@ RETURN R0 0
 
 TEST_CASE("ConcatChainOptimization")
 {
-    CHECK_EQ("\n" + compileFunction0("return '1' .. '2'"), R"(
-LOADK R1 K0 ['1']
-LOADK R2 K1 ['2']
-CONCAT R0 R1 R2
-RETURN R0 1
+    CHECK_EQ("\n" + compileFunction0("local a, b = ...; return a .. b"), R"(
+GETVARARGS R0 2
+MOVE R3 R0
+MOVE R4 R1
+CONCAT R2 R3 R4
+RETURN R2 1
 )");
 
-    CHECK_EQ("\n" + compileFunction0("return '1' .. '2' .. '3'"), R"(
-LOADK R1 K0 ['1']
-LOADK R2 K1 ['2']
-LOADK R3 K2 ['3']
-CONCAT R0 R1 R3
-RETURN R0 1
+    CHECK_EQ("\n" + compileFunction0("local a, b, c = ...; return a .. b .. c"), R"(
+GETVARARGS R0 3
+MOVE R4 R0
+MOVE R5 R1
+MOVE R6 R2
+CONCAT R3 R4 R6
+RETURN R3 1
 )");
 
-    CHECK_EQ("\n" + compileFunction0("return ('1' .. '2') .. '3'"), R"(
-LOADK R3 K0 ['1']
-LOADK R4 K1 ['2']
-CONCAT R1 R3 R4
-LOADK R2 K2 ['3']
-CONCAT R0 R1 R2
-RETURN R0 1
+    CHECK_EQ("\n" + compileFunction0("local a, b, c = ...; return (a .. b) .. c"), R"(
+GETVARARGS R0 3
+MOVE R6 R0
+MOVE R7 R1
+CONCAT R4 R6 R7
+MOVE R5 R2
+CONCAT R3 R4 R5
+RETURN R3 1
 )");
 }
 
@@ -1349,11 +1465,11 @@ TEST_CASE("InterpStringWithNoExpressions")
 TEST_CASE("InterpStringZeroCost")
 {
     CHECK_EQ(
-        "\n" + compileFunction0(R"(local _ = `hello, {"world"}!`)"),
+        "\n" + compileFunction0(R"(local _ = `hello, {42}!`)"),
         R"(
 LOADK R1 K0 ['hello, %*!']
-LOADK R3 K1 ['world']
-NAMECALL R1 R1 K2 ['format']
+LOADN R3 42
+NAMECALL R1 R1 K1 ['format']
 CALL R1 2 1
 MOVE R0 R1
 RETURN R0 0
@@ -1366,7 +1482,7 @@ TEST_CASE("InterpStringRegisterCleanup")
     CHECK_EQ(
         "\n" + compileFunction0(R"(
             local a, b, c = nil, "um", "uh oh"
-            a = `foo{"bar"}`
+            a = `foo{42}`
             print(a)
         )"),
 
@@ -1375,11 +1491,11 @@ LOADNIL R0
 LOADK R1 K0 ['um']
 LOADK R2 K1 ['uh oh']
 LOADK R3 K2 ['foo%*']
-LOADK R5 K3 ['bar']
-NAMECALL R3 R3 K4 ['format']
+LOADN R5 42
+NAMECALL R3 R3 K3 ['format']
 CALL R3 2 1
 MOVE R0 R3
-GETIMPORT R3 6 [print]
+GETIMPORT R3 5 [print]
 MOVE R4 R0
 CALL R3 1 0
 RETURN R0 0
@@ -1391,6 +1507,49 @@ TEST_CASE("InterpStringRegisterLimit")
 {
     CHECK_THROWS_AS(compileFunction0(("local a = `" + rep("{1}", 254) + "`").c_str()), std::exception);
     CHECK_THROWS_AS(compileFunction0(("local a = `" + rep("{1}", 253) + "`").c_str()), std::exception);
+}
+
+TEST_CASE("InterpStringConstFold")
+{
+    CHECK_EQ(
+        "\n" + compileFunction0(R"(local empty = ""; return `{empty}`)"),
+        R"(
+LOADK R0 K0 ['']
+RETURN R0 1
+)"
+    );
+
+    CHECK_EQ(
+        "\n" + compileFunction0(R"(local world = "world"; return `hello, {world}!`)"),
+        R"(
+LOADK R0 K0 ['hello, world!']
+RETURN R0 1
+)"
+    );
+
+    CHECK_EQ(
+        "\n" + compileFunction0(R"(local not_string = 42; local world = "world"; return `hello, {world} {not_string}!`)"),
+        R"(
+LOADK R1 K0 ['hello, world %*!']
+LOADN R3 42
+NAMECALL R1 R1 K1 ['format']
+CALL R1 2 1
+MOVE R0 R1
+RETURN R0 1
+)"
+    );
+
+    CHECK_EQ(
+        "\n" + compileFunction0(R"(local not_string = 42; local str = "%s%s%s"; return `hello, {str} {not_string}!`)"),
+        R"(
+LOADK R1 K0 ['hello, %%s%%s%%s %*!']
+LOADN R3 42
+NAMECALL R1 R1 K1 ['format']
+CALL R1 2 1
+MOVE R0 R1
+RETURN R0 1
+)"
+    );
 }
 
 TEST_CASE("ConstantFoldArith")
@@ -1433,6 +1592,125 @@ RETURN R0 1
     // nested arith expression with groups
     CHECK_EQ("\n" + compileFunction0("return (2 + 2) * 2"), R"(
 LOADN R0 8
+RETURN R0 1
+)");
+}
+
+TEST_CASE("ConstantFoldVectorArith")
+{
+    CHECK_EQ("\n" + compileFunction("local n = 2; local a, b = vector.create(1, 2, 3), vector.create(2, 4, 8); return a + b", 0, 2), R"(
+LOADK R0 K0 [3, 6, 11]
+RETURN R0 1
+)");
+
+    CHECK_EQ("\n" + compileFunction("local n = 2; local a, b = vector.create(1, 2, 3), vector.create(2, 4, 8); return a - b", 0, 2), R"(
+LOADK R0 K0 [-1, -2, -5]
+RETURN R0 1
+)");
+
+    // Multiplication by infinity cannot be folded as it creates a non-zero value in W
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   "local n = 2; local a, b = vector.create(1, 2, 3), vector.create(2, 4, 8); return a * n, a * b, n * b, a * math.huge", 0, 2
+               ),
+        R"(
+LOADK R0 K0 [2, 4, 6]
+LOADK R1 K1 [2, 8, 24]
+LOADK R2 K2 [4, 8, 16]
+LOADK R4 K4 [1, 2, 3]
+MULK R3 R4 K3 [inf]
+RETURN R0 4
+)"
+    );
+
+    // Divisions creating an infinity in W cannot be constant-folded
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   "local n = 2; local a, b = vector.create(1, 2, 3), vector.create(2, 4, 8); return a / n, a / b, n / b, a / math.huge", 0, 2
+               ),
+        R"(
+LOADK R0 K0 [0.5, 1, 1.5]
+LOADK R2 K1 [1, 2, 3]
+LOADK R3 K2 [2, 4, 8]
+DIV R1 R2 R3
+LOADK R3 K2 [2, 4, 8]
+DIVRK R2 K3 [2] R3
+LOADK R3 K4 [0, 0, 0]
+RETURN R0 4
+)"
+    );
+
+    // Divisions creating an infinity in W cannot be constant-folded
+    CHECK_EQ(
+        "\n" + compileFunction("local n = 2; local a, b = vector.create(1, 2, 3), vector.create(2, 4, 8); return a // n, a // b, n // b", 0, 2),
+        R"(
+LOADK R0 K0 [0, 1, 1]
+LOADK R2 K1 [1, 2, 3]
+LOADK R3 K2 [2, 4, 8]
+IDIV R1 R2 R3
+LOADN R3 2
+LOADK R4 K2 [2, 4, 8]
+IDIV R2 R3 R4
+RETURN R0 3
+)"
+    );
+
+    CHECK_EQ("\n" + compileFunction("local a = vector.create(1, 2, 3); return -a", 0, 2), R"(
+LOADK R0 K0 [-1, -2, -3]
+RETURN R0 1
+)");
+}
+
+TEST_CASE("ConstantFoldVectorArith4Wide")
+{
+    CHECK_EQ("\n" + compileFunction("local n = 2; local a, b = vector.create(1, 2, 3, 4), vector.create(2, 4, 8, 1); return a + b", 0, 2), R"(
+LOADK R0 K0 [3, 6, 11, 5]
+RETURN R0 1
+)");
+
+    CHECK_EQ("\n" + compileFunction("local n = 2; local a, b = vector.create(1, 2, 3, 4), vector.create(2, 4, 8, 1); return a - b", 0, 2), R"(
+LOADK R0 K0 [-1, -2, -5, 3]
+RETURN R0 1
+)");
+
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   "local n = 2; local a, b = vector.create(1, 2, 3, 4), vector.create(2, 4, 8, 1); return a * n, a * b, n * b, a * math.huge", 0, 2
+               ),
+        R"(
+LOADK R0 K0 [2, 4, 6, 8]
+LOADK R1 K1 [2, 8, 24, 4]
+LOADK R2 K2 [4, 8, 16, 2]
+LOADK R3 K3 [inf, inf, inf, inf]
+RETURN R0 4
+)"
+    );
+
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   "local n = 2; local a, b = vector.create(1, 2, 3, 4), vector.create(2, 4, 8, 1); return a / n, a / b, n / b, a / math.huge", 0, 2
+               ),
+        R"(
+LOADK R0 K0 [0.5, 1, 1.5, 2]
+LOADK R1 K1 [0.5, 0.5, 0.375, 4]
+LOADK R2 K2 [1, 0.5, 0.25, 2]
+LOADK R3 K3 [0, 0, 0]
+RETURN R0 4
+)"
+    );
+
+    CHECK_EQ(
+        "\n" + compileFunction("local n = 2; local a, b = vector.create(1, 2, 3, 4), vector.create(2, 4, 8, 1); return a // n, a // b, n // b", 0, 2),
+        R"(
+LOADK R0 K0 [0, 1, 1, 2]
+LOADK R1 K1 [0, 0, 0, 4]
+LOADK R2 K2 [1, 0, 0, 2]
+RETURN R0 3
+)"
+    );
+
+    CHECK_EQ("\n" + compileFunction("local a = vector.create(1, 2, 3, 4); return -a", 0, 2), R"(
+LOADK R0 K0 [-1, -2, -3, -4]
 RETURN R0 1
 )");
 }
@@ -1747,6 +2025,118 @@ RETURN R0 0
 )");
 }
 
+TEST_CASE("TerminatingConstantFoldFlowControl")
+{
+    ScopedFastFlag luauCompileCallCostModel{FFlag::LuauCompileCallCostModel, true};
+
+    // if
+    CHECK_EQ(
+        "\n" + compileFunction0(R"(
+if true then
+    return 42
+end
+
+print("not reachable")
+)"),
+        R"(
+LOADN R0 42
+RETURN R0 1
+)"
+    );
+
+    CHECK_EQ(
+        "\n" + compileFunction0(R"(
+if false then
+    print("not seen")
+else
+    return 42
+end
+
+print("not reachable")
+)"),
+        R"(
+LOADN R0 42
+RETURN R0 1
+)"
+    );
+
+    CHECK_EQ(
+        "\n" + compileFunction0(R"(
+do
+    if true then
+        return 42
+    end
+end
+
+print("not reachable")
+)"),
+        R"(
+LOADN R0 42
+RETURN R0 1
+)"
+    );
+
+    CHECK_EQ(
+        "\n" + compileFunction0(R"(
+do
+    if true then
+        return 42
+    end
+
+    if false then
+        print("not seen")
+    end
+end
+
+print("not reachable")
+)"),
+        R"(
+LOADN R0 42
+RETURN R0 1
+)"
+    );
+
+    // while
+    CHECK_EQ(
+        "\n" + compileFunction0(R"(
+while true do
+    if true then
+        break
+    end
+
+    print("unreachable")
+end
+
+return 42
+)"),
+        R"(
+JUMP L0
+JUMPBACK L0
+L0: LOADN R0 42
+RETURN R0 1
+)"
+    );
+
+    // return from while
+    CHECK_EQ(
+        "\n" + compileFunction0(R"(
+while true do
+    if true then
+        return 42
+    end
+
+    print("unseen")
+end
+)"),
+        R"(
+L0: LOADN R0 42
+RETURN R0 1
+JUMPBACK L0
+RETURN R0 0
+)"
+    );
+}
+
 TEST_CASE("LoopBreak")
 {
     // default codegen: compile breaks as unconditional jumps
@@ -1907,8 +2297,10 @@ until (function() return rr end)() < 0.5
 
     // unless that upvalue is from an outer scope
     CHECK_EQ(
-        "\n" + compileFunction0("local stop = false stop = true function test() repeat local r = math.random() if r > 0.5 then "
-                                "continue end r = r + 0.3 until stop or r < 0.5 end"),
+        "\n" + compileFunction0(
+                   "local stop = false stop = true function test() repeat local r = math.random() if r > 0.5 then "
+                   "continue end r = r + 0.3 until stop or r < 0.5 end"
+               ),
         R"(
 L0: GETIMPORT R0 2 [math.random]
 CALL R0 0 1
@@ -2425,167 +2817,131 @@ RETURN R8 -1
     );
 }
 
-TEST_CASE("RecursionParse")
+TEST_CASE_FIXTURE(RecursionLimitFixture, "RecursionParseTableConstructor")
 {
-    // The test forcibly pushes the stack limit during compilation; in NoOpt, the stack consumption is much larger so we need to reduce the limit to
-    // not overflow the C stack. When ASAN is enabled, stack consumption increases even more.
-#if defined(LUAU_ENABLE_ASAN)
-    ScopedFastInt flag(FInt::LuauRecursionLimit, 200);
-#elif defined(_NOOPT) || defined(_DEBUG)
-    ScopedFastInt flag(FInt::LuauRecursionLimit, 300);
-#endif
+    // NOTE(2025-11-25) Limit of 1510 on VS2022 optimized build
 
-    Luau::BytecodeBuilder bcb;
+    checkLimit("a=" + rep("{", reps) + rep("}", reps), "Exceeded allowed recursion depth; simplify your expression to make the code compile");
+}
 
-    try
-    {
-        Luau::compileOrThrow(bcb, "a=" + rep("{", 1500) + rep("}", 1500));
-        CHECK(!"Expected exception");
-    }
-    catch (std::exception& e)
-    {
-        CHECK_EQ(std::string(e.what()), "Exceeded allowed recursion depth; simplify your expression to make the code compile");
-    }
+TEST_CASE_FIXTURE(RecursionLimitFixture, "RecursionParseFunctionNameIndex")
+{
+    // NOTE(2025-11-25) No parsing limit
 
-    try
-    {
-        Luau::compileOrThrow(bcb, "function a" + rep(".a", 1500) + "() end");
-        CHECK(!"Expected exception");
-    }
-    catch (std::exception& e)
-    {
-        CHECK_EQ(std::string(e.what()), "Exceeded allowed recursion depth; simplify your function name to make the code compile");
-    }
+    checkLimit("function a" + rep(".a", reps) + "() end", "Exceeded allowed recursion depth; simplify your function name to make the code compile");
+}
 
-    try
-    {
-        Luau::compileOrThrow(bcb, "a=1" + rep("+1", 1500));
-        CHECK(!"Expected exception");
-    }
-    catch (std::exception& e)
-    {
-        CHECK_EQ(std::string(e.what()), "Exceeded allowed recursion depth; simplify your expression to make the code compile");
-    }
+TEST_CASE_FIXTURE(RecursionLimitFixture, "RecursionParseBinaryOp")
+{
+    // NOTE(2025-11-25) No parsing limit
 
-    try
-    {
-        Luau::compileOrThrow(bcb, "a=" + rep("(", 1500) + "1" + rep(")", 1500));
-        CHECK(!"Expected exception");
-    }
-    catch (std::exception& e)
-    {
-        CHECK_EQ(std::string(e.what()), "Exceeded allowed recursion depth; simplify your expression to make the code compile");
-    }
+    checkLimit("a=1" + rep("+1", reps), "Exceeded allowed recursion depth; simplify your expression to make the code compile");
+}
 
-    try
-    {
-        Luau::compileOrThrow(bcb, rep("do ", 1500) + "print()" + rep(" end", 1500));
-        CHECK(!"Expected exception");
-    }
-    catch (std::exception& e)
-    {
-        CHECK_EQ(std::string(e.what()), "Exceeded allowed recursion depth; simplify your block to make the code compile");
-    }
+TEST_CASE_FIXTURE(RecursionLimitFixture, "RecursionParseGroupExpr")
+{
+    // NOTE(2025-11-25) Limit of 1590 on VS2022 optimized build
 
-    try
-    {
-        Luau::compileOrThrow(bcb, rep("a(", 1500) + "42" + rep(")", 1500));
-        CHECK(!"Expected exception");
-    }
-    catch (std::exception& e)
-    {
-        CHECK_EQ(std::string(e.what()), "Exceeded allowed recursion depth; simplify your expression to make the code compile");
-    }
+    checkLimit("a=" + rep("(", reps) + "1" + rep(")", reps), "Exceeded allowed recursion depth; simplify your expression to make the code compile");
+}
 
-    try
-    {
-        Luau::compileOrThrow(bcb, "return " + rep("{", 1500) + "42" + rep("}", 1500));
-        CHECK(!"Expected exception");
-    }
-    catch (std::exception& e)
-    {
-        CHECK_EQ(std::string(e.what()), "Exceeded allowed recursion depth; simplify your expression to make the code compile");
-    }
+TEST_CASE_FIXTURE(RecursionLimitFixture, "RecursionParseDoBlock")
+{
+    // NOTE(2025-11-25) Limit of 2380 on VS2022 optimized build
 
-    try
-    {
-        Luau::compileOrThrow(bcb, rep("while true do ", 1500) + "print()" + rep(" end", 1500));
-        CHECK(!"Expected exception");
-    }
-    catch (std::exception& e)
-    {
-        CHECK_EQ(std::string(e.what()), "Exceeded allowed recursion depth; simplify your expression to make the code compile");
-    }
+    checkLimit(rep("do ", reps) + "print()" + rep(" end", reps), "Exceeded allowed recursion depth; simplify your block to make the code compile");
+}
 
-    try
-    {
-        Luau::compileOrThrow(bcb, rep("for i=1,1 do ", 1500) + "print()" + rep(" end", 1500));
-        CHECK(!"Expected exception");
-    }
-    catch (std::exception& e)
-    {
-        CHECK_EQ(std::string(e.what()), "Exceeded allowed recursion depth; simplify your expression to make the code compile");
-    }
+TEST_CASE_FIXTURE(RecursionLimitFixture, "RecursionParseFunctionArguments")
+{
+    // NOTE(2025-11-25) Limit of 1070 on VS2022 optimized build
 
-    try
-    {
-        Luau::compileOrThrow(bcb, rep("function a() ", 1500) + "print()" + rep(" end", 1500));
-        CHECK(!"Expected exception");
-    }
-    catch (std::exception& e)
-    {
-        CHECK_EQ(std::string(e.what()), "Exceeded allowed recursion depth; simplify your block to make the code compile");
-    }
+    checkLimit(rep("a(", reps) + "42" + rep(")", reps), "Exceeded allowed recursion depth; simplify your expression to make the code compile");
+}
 
-    try
-    {
-        Luau::compileOrThrow(bcb, "return " + rep("function() return ", 1500) + "42" + rep(" end", 1500));
-        CHECK(!"Expected exception");
-    }
-    catch (std::exception& e)
-    {
-        CHECK_EQ(std::string(e.what()), "Exceeded allowed recursion depth; simplify your block to make the code compile");
-    }
+TEST_CASE_FIXTURE(RecursionLimitFixture, "RecursionParseReturnTableConstructor")
+{
+    // NOTE(2025-11-25) Limit of 1510 on VS2022 optimized build
 
-    try
-    {
-        Luau::compileOrThrow(bcb, "local f: " + rep("(", 1500) + "nil" + rep(")", 1500));
-        CHECK(!"Expected exception");
-    }
-    catch (std::exception& e)
-    {
-        CHECK_EQ(std::string(e.what()), "Exceeded allowed recursion depth; simplify your type annotation to make the code compile");
-    }
+    checkLimit(
+        "return " + rep("{", reps) + "42" + rep("}", reps), "Exceeded allowed recursion depth; simplify your expression to make the code compile"
+    );
+}
 
-    try
-    {
-        Luau::compileOrThrow(bcb, "local f: () " + rep("-> ()", 1500));
-        CHECK(!"Expected exception");
-    }
-    catch (std::exception& e)
-    {
-        CHECK_EQ(std::string(e.what()), "Exceeded allowed recursion depth; simplify your type annotation to make the code compile");
-    }
+TEST_CASE_FIXTURE(RecursionLimitFixture, "RecursionParseWhile")
+{
+    // NOTE(2025-11-25) Limit of 2380 on VS2022 optimized build
 
-    try
-    {
-        Luau::compileOrThrow(bcb, "local f: " + rep("{x:", 1500) + "nil" + rep("}", 1500));
-        CHECK(!"Expected exception");
-    }
-    catch (std::exception& e)
-    {
-        CHECK_EQ(std::string(e.what()), "Exceeded allowed recursion depth; simplify your type annotation to make the code compile");
-    }
+    checkLimit(
+        rep("while true do ", reps) + "print()" + rep(" end", reps),
+        "Exceeded allowed recursion depth; simplify your expression to make the code compile"
+    );
+}
 
-    try
-    {
-        Luau::compileOrThrow(bcb, "local f: " + rep("(nil & ", 1500) + "nil" + rep(")", 1500));
-        CHECK(!"Expected exception");
-    }
-    catch (std::exception& e)
-    {
-        CHECK_EQ(std::string(e.what()), "Exceeded allowed recursion depth; simplify your type annotation to make the code compile");
-    }
+TEST_CASE_FIXTURE(RecursionLimitFixture, "RecursionParseFor")
+{
+    // NOTE(2025-11-25) Limit of 1130 on VS2022 optimized build
+
+    checkLimit(
+        rep("for i=1,1 do ", reps) + "print()" + rep(" end", reps),
+        "Exceeded allowed recursion depth; simplify your expression to make the code compile"
+    );
+}
+
+TEST_CASE_FIXTURE(RecursionLimitFixture, "RecursionParseFunctionStatement")
+{
+    // NOTE(2025-11-25) Limit of 1150 on VS2022 optimized build
+
+    checkLimit(
+        rep("function a() ", reps) + "print()" + rep(" end", reps), "Exceeded allowed recursion depth; simplify your block to make the code compile"
+    );
+}
+
+TEST_CASE_FIXTURE(RecursionLimitFixture, "RecursionParseFunctionExpr")
+{
+    // NOTE(2025-11-25) Limit of 1380 on VS2022 optimized build
+
+    checkLimit(
+        "return " + rep("function() return ", reps) + "42" + rep(" end", reps),
+        "Exceeded allowed recursion depth; simplify your block to make the code compile"
+    );
+}
+
+TEST_CASE_FIXTURE(RecursionLimitFixture, "RecursionParseTypeAnnotationGroup")
+{
+    // NOTE(2025-11-25) Limit of 1650 on VS2022 optimized build
+
+    checkLimit(
+        "local f: " + rep("(", reps) + "nil" + rep(")", reps),
+        "Exceeded allowed recursion depth; simplify your type annotation to make the code compile"
+    );
+}
+
+TEST_CASE_FIXTURE(RecursionLimitFixture, "RecursionParseTypeAnnotationFunction")
+{
+    // NOTE(2025-11-25) Limit of 2810 on VS2022 optimized build
+
+    checkLimit("local f: () " + rep("-> ()", reps), "Exceeded allowed recursion depth; simplify your type annotation to make the code compile");
+}
+
+TEST_CASE_FIXTURE(RecursionLimitFixture, "RecursionParseTypeAnnotationTable")
+{
+    // NOTE(2025-11-25) Limit of 2000 on VS2022 optimized build
+
+    checkLimit(
+        "local f: " + rep("{x:", reps) + "nil" + rep("}", reps),
+        "Exceeded allowed recursion depth; simplify your type annotation to make the code compile"
+    );
+}
+
+TEST_CASE_FIXTURE(RecursionLimitFixture, "RecursionParseTypeAnnotationIntersectionGroup")
+{
+    // NOTE(2025-11-25) Limit of 1990 on VS2022 optimized build
+
+    checkLimit(
+        "local f: " + rep("(nil & ", reps) + "nil" + rep(")", reps),
+        "Exceeded allowed recursion depth; simplify your type annotation to make the code compile"
+    );
 }
 
 TEST_CASE("ArrayIndexLiteral")
@@ -2799,12 +3155,35 @@ TEST_CASE("TypeAliasing")
 
 TEST_CASE("TypeFunction")
 {
-    ScopedFastFlag sff{FFlag::LuauUserDefinedTypeFunctionsSyntax2, true};
-
     Luau::BytecodeBuilder bcb;
     Luau::CompileOptions options;
     Luau::ParseOptions parseOptions;
     CHECK_NOTHROW(Luau::compileOrThrow(bcb, "type function a() return types.any end", options, parseOptions));
+}
+
+TEST_CASE("NoTypeFunctionsInBytecode")
+{
+    Luau::BytecodeBuilder bcb;
+    bcb.setDumpFlags(Luau::BytecodeBuilder::Dump_Code);
+    Luau::compileOrThrow(bcb, R"(
+type function a() return types.any end
+function b() return 2 end
+return b()
+)");
+
+    CHECK_EQ("\n" + bcb.dumpEverything(), R"(
+Function 0 (b):
+LOADN R0 2
+RETURN R0 1
+
+Function 1 (??):
+DUPCLOSURE R0 K0 ['b']
+SETGLOBAL R0 K1 ['b']
+GETGLOBAL R0 K1 ['b']
+CALL R0 0 -1
+RETURN R0 -1
+
+)");
 }
 
 TEST_CASE("DebugLineInfo")
@@ -3406,9 +3785,10 @@ RETURN R4 1
 )");
 }
 
-TEST_CASE("SourceRemarks")
+TEST_CASE("CostModelRemarks")
 {
-    const char* source = R"(
+    CHECK_EQ(
+        compileWithRemarks(R"(
 local a, b = ...
 
 local function foo(x)
@@ -3416,20 +3796,8 @@ local function foo(x)
 end
 
 return foo(a) + foo(assert(b))
-)";
-
-    Luau::BytecodeBuilder bcb;
-    bcb.setDumpFlags(Luau::BytecodeBuilder::Dump_Source | Luau::BytecodeBuilder::Dump_Remarks);
-    bcb.setDumpSource(source);
-
-    Luau::CompileOptions options;
-    options.optimizationLevel = 2;
-
-    Luau::compileOrThrow(bcb, source, options);
-
-    std::string remarks = bcb.dumpSourceRemarks();
-
-    CHECK_EQ(remarks, R"(
+)"),
+        R"(
 local a, b = ...
 
 local function foo(x)
@@ -3440,7 +3808,149 @@ end
 -- remark: builtin assert/1
 -- remark: inlining succeeded (cost 2, profit 2.50x, depth 0)
 return foo(a) + foo(assert(b))
-)");
+)"
+    );
+
+    CHECK_EQ(
+        compileWithRemarks(R"(
+local value = true
+
+local function foo()
+    return value
+end
+
+return foo()
+)"),
+        R"(
+local value = true
+
+local function foo()
+    return value
+end
+
+-- remark: inlining succeeded (cost 0, profit 3.00x, depth 0)
+return foo()
+)"
+    );
+
+    CHECK_EQ(
+        compileWithRemarks(R"(
+local value = true
+
+local function foo()
+    return not value
+end
+
+return foo()
+)"),
+        R"(
+local value = true
+
+local function foo()
+    return not value
+end
+
+-- remark: inlining succeeded (cost 0, profit 3.00x, depth 0)
+return foo()
+)"
+    );
+
+    CHECK_EQ(
+        compileWithRemarks(R"(
+local function foo()
+    local s = 0
+    for i = 1, 100 do s += i end
+    return s
+end
+
+return foo()
+)"),
+        R"(
+local function foo()
+    local s = 0
+    -- remark: loop unroll failed: too many iterations (100)
+    for i = 1, 100 do s += i end
+    return s
+end
+
+-- remark: inlining failed: too expensive (cost 127, profit 1.02x)
+return foo()
+)"
+    );
+
+    CHECK_EQ(
+        compileWithRemarks(R"(
+local function foo()
+    local s = 0
+    for i = 1, 4 * 25 do s += i end
+    return s
+end
+
+return foo()
+)"),
+        R"(
+local function foo()
+    local s = 0
+    -- remark: loop unroll failed: too many iterations (100)
+    for i = 1, 4 * 25 do s += i end
+    return s
+end
+
+-- remark: inlining failed: too expensive (cost 127, profit 1.02x)
+return foo()
+)"
+    );
+
+    CHECK_EQ(
+        compileWithRemarks(R"(
+local x = ...
+local function test(a)
+    while a < 0 do
+        a += 1
+    end
+    for i=10,1,-1 do
+        a += 1
+    end
+    for i in pairs({}) do
+        a += 1
+        if a % 2 == 0 then continue end
+    end
+    repeat
+        a += 1
+        if a % 2 == 0 then break end
+    until a > 10
+    return a
+end
+local a = test(x)
+local b = test(2)
+)"),
+        R"(
+local x = ...
+local function test(a)
+    while a < 0 do
+        a += 1
+    end
+    -- remark: loop unroll succeeded (iterations 10, cost 10, profit 2.00x)
+    for i=10,1,-1 do
+        a += 1
+    end
+    -- remark: allocation: table hash 0
+    for i in pairs({}) do
+        a += 1
+        if a % 2 == 0 then continue end
+    end
+    repeat
+        a += 1
+        if a % 2 == 0 then break end
+    until a > 10
+    return a
+end
+-- remark: inlining failed: too expensive (cost 76, profit 1.03x)
+local a = test(x)
+-- remark: inlining failed: too expensive (cost 73, profit 1.08x)
+local b = test(2)
+)"
+    );
 }
 
 TEST_CASE("AssignmentConflict")
@@ -4926,36 +5436,78 @@ L0: RETURN R3 -1
 )");
 }
 
-TEST_CASE("VectorLiterals")
+TEST_CASE("VectorConstants")
 {
-    CHECK_EQ("\n" + compileFunction("return Vector3.new(1, 2, 3)", 0, 2, /*enableVectors*/ true), R"(
+    CHECK_EQ("\n" + compileFunction("return vector.create(1, 2)", 0, 2, 0), R"(
+LOADK R0 K0 [1, 2, 0]
+RETURN R0 1
+)");
+
+    CHECK_EQ("\n" + compileFunction("return vector.create(1, 2, 3)", 0, 2, 0), R"(
 LOADK R0 K0 [1, 2, 3]
 RETURN R0 1
 )");
 
-    CHECK_EQ("\n" + compileFunction("print(Vector3.new(1, 2, 3))", 0, 2, /*enableVectors*/ true), R"(
+    CHECK_EQ("\n" + compileFunction("print(vector.create(1, 2, 3))", 0, 2, 0), R"(
 GETIMPORT R0 1 [print]
 LOADK R1 K2 [1, 2, 3]
 CALL R0 1 0
 RETURN R0 0
 )");
 
-    CHECK_EQ("\n" + compileFunction("print(Vector3.new(1, 2, 3, 4))", 0, 2, /*enableVectors*/ true), R"(
+    CHECK_EQ("\n" + compileFunction("print(vector.create(1, 2, 3, 4))", 0, 2, 0), R"(
 GETIMPORT R0 1 [print]
 LOADK R1 K2 [1, 2, 3, 4]
 CALL R0 1 0
 RETURN R0 0
 )");
 
-    CHECK_EQ("\n" + compileFunction("return Vector3.new(0, 0, 0), Vector3.new(-0, 0, 0)", 0, 2, /*enableVectors*/ true), R"(
+    CHECK_EQ("\n" + compileFunction("return vector.create(0, 0, 0), vector.create(-0, 0, 0)", 0, 2, 0), R"(
 LOADK R0 K0 [0, 0, 0]
 LOADK R1 K1 [-0, 0, 0]
 RETURN R0 2
 )");
 
-    CHECK_EQ("\n" + compileFunction("return type(Vector3.new(0, 0, 0))", 0, 2, /*enableVectors*/ true), R"(
+    CHECK_EQ("\n" + compileFunction("return type(vector.create(0, 0, 0))", 0, 2, 0), R"(
 LOADK R0 K0 ['vector']
 RETURN R0 1
+)");
+
+    // test legacy constructor
+    CHECK_EQ("\n" + compileFunction("return Vector3.new(1, 2, 3)", 0, 2, 0), R"(
+LOADK R0 K0 [1, 2, 3]
+RETURN R0 1
+)");
+}
+
+TEST_CASE("VectorConstantFields")
+{
+    CHECK_EQ("\n" + compileFunction("return vector.one, vector.zero", 0, 2), R"(
+LOADK R0 K0 [1, 1, 1]
+LOADK R1 K1 [0, 0, 0]
+RETURN R0 2
+)");
+
+    CHECK_EQ("\n" + compileFunction("return Vector3.one, Vector3.xAxis", 0, 2, 0), R"(
+LOADK R0 K0 [1, 1, 1]
+LOADK R1 K1 [1, 0, 0]
+RETURN R0 2
+)");
+
+    CHECK_EQ("\n" + compileFunction("return vector.one == vector.create(1, 1, 1)", 0, 2), R"(
+LOADB R0 1
+RETURN R0 1
+)");
+}
+
+TEST_CASE("CustomConstantFields")
+{
+    CHECK_EQ("\n" + compileFunction("return test.some_nil, test.some_boolean, test.some_number, test.some_string", 0, 2), R"(
+LOADNIL R0
+LOADB R1 1
+LOADK R2 K0 [4.75]
+LOADK R3 K1 ['test']
+RETURN R0 4
 )");
 }
 
@@ -5805,6 +6357,8 @@ L3: RETURN R0 0
 
 TEST_CASE("InlineBasic")
 {
+    ScopedFastFlag luauCompileCallCostModel{FFlag::LuauCompileCallCostModel, true};
+
     // inline function that returns a constant
     CHECK_EQ(
         "\n" + compileFunction(
@@ -5871,7 +6425,6 @@ GETIMPORT R2 3 [math.random]
 CALL R2 0 1
 MOVE R1 R2
 RETURN R1 1
-RETURN R1 1
 )"
     );
 
@@ -5898,7 +6451,6 @@ DUPCLOSURE R0 K0 ['foo']
 GETIMPORT R2 3 [math.random]
 CALL R2 0 1
 LOADN R1 5
-RETURN R1 1
 RETURN R1 1
 )"
     );
@@ -6817,6 +7369,8 @@ RETURN R3 1
 
 TEST_CASE("InlineIIFE")
 {
+    ScopedFastFlag luauCompileCallCostModel{FFlag::LuauCompileCallCostModel, true};
+
     // IIFE with arguments
     CHECK_EQ(
         "\n" + compileFunction(
@@ -6833,7 +7387,6 @@ JUMPIFNOT R0 L0
 MOVE R3 R1
 RETURN R3 1
 L0: MOVE R3 R2
-RETURN R3 1
 RETURN R3 1
 )"
     );
@@ -6854,7 +7407,6 @@ JUMPIFNOT R0 L0
 MOVE R3 R1
 RETURN R3 1
 L0: MOVE R3 R2
-RETURN R3 1
 RETURN R3 1
 )"
     );
@@ -7239,6 +7791,566 @@ RETURN R1 1
     );
 }
 
+TEST_CASE("InlineNonConstInitializers")
+{
+    ScopedFastFlag luauCompileInlineInitializers{FFlag::LuauCompileInlineInitializers, true};
+
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local function caller(f)
+    f(1)
+end
+
+local function callback(n)
+    print(n + 5)
+end
+
+caller(callback)
+)",
+                   2,
+                   2
+               ),
+        R"(
+DUPCLOSURE R0 K0 ['caller']
+DUPCLOSURE R1 K1 ['callback']
+GETIMPORT R2 3 [print]
+LOADN R3 6
+CALL R2 1 0
+RETURN R0 0
+)"
+    );
+
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local x, y, z = ...
+local function test(a, b, c, comp)
+    return comp(a, b) and comp(b, c)
+end
+
+local function greater(a, b)
+    return a > b
+end
+
+test(x, y, z, greater)
+)",
+                   2,
+                   2
+               ),
+        R"(
+GETVARARGS R0 3
+DUPCLOSURE R3 K0 ['test']
+DUPCLOSURE R4 K1 ['greater']
+JUMPIFLT R1 R0 L0
+LOADB R5 0 +1
+L0: LOADB R5 1
+L1: JUMPIFNOT R5 L3
+JUMPIFLT R2 R1 L2
+LOADB R5 0 +1
+L2: LOADB R5 1
+L3: RETURN R0 0
+)"
+    );
+
+    // inlined when passed as a temporary
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local x, y, z = ...
+local function test(a, b, c, comp)
+    return comp(a, b) and comp(b, c)
+end
+
+test(x, y, z, function(a, b) return a > b end)
+)",
+                   2,
+                   2
+               ),
+        R"(
+GETVARARGS R0 3
+DUPCLOSURE R3 K0 ['test']
+DUPCLOSURE R4 K1 []
+JUMPIFLT R1 R0 L0
+LOADB R5 0 +1
+L0: LOADB R5 1
+L1: JUMPIFNOT R5 L3
+JUMPIFLT R2 R1 L2
+LOADB R5 0 +1
+L2: LOADB R5 1
+L3: RETURN R0 0
+)"
+    );
+
+    // inlined passed as an upvalue
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local function test(a, b, c, comp)
+    return comp(a, b) and comp(b, c)
+end
+
+local function greater(a, b)
+    return a > b
+end
+
+local function bar(x, y, z)
+    return test(x, y, z, greater)
+end
+)",
+                   2,
+                   2
+               ),
+        R"(
+GETUPVAL R4 0
+JUMPIFLT R1 R0 L0
+LOADB R3 0 +1
+L0: LOADB R3 1
+L1: JUMPIFNOT R3 L3
+JUMPIFLT R2 R1 L2
+LOADB R3 0 +1
+L2: LOADB R3 1
+L3: RETURN R3 1
+)"
+    );
+
+    // not inlined when the upvalue is mutable
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local function test(a, b, c, comp)
+    return comp(a, b) and comp(b, c)
+end
+
+local function greater(a, b)
+    return a > b
+end
+
+local function bar(x, y, z)
+    return test(x, y, z, greater)
+end
+
+greater = function(a, b) return a < b end
+)",
+                   2,
+                   2
+               ),
+        R"(
+GETUPVAL R4 0
+MOVE R5 R4
+MOVE R6 R0
+MOVE R7 R1
+CALL R5 2 1
+MOVE R3 R5
+JUMPIFNOT R3 L0
+MOVE R5 R4
+MOVE R6 R1
+MOVE R7 R2
+CALL R5 2 1
+MOVE R3 R5
+L0: RETURN R3 1
+)"
+    );
+
+    // not inlined when argument itself is mutable
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local x, y, z, debug = ...
+local function test(a, b, c, comp)
+    if debug then comp = function(a, b) return a >= b end end
+
+    return comp(a, b) and comp(b, c)
+end
+
+test(x, y, z, function(a, b) return a > b end)
+)",
+                   3,
+                   2
+               ),
+        R"(
+GETVARARGS R0 4
+DUPCLOSURE R4 K0 ['test']
+CAPTURE VAL R3
+DUPCLOSURE R5 K1 []
+JUMPIFNOT R3 L0
+DUPCLOSURE R5 K2 []
+L0: MOVE R6 R5
+MOVE R7 R0
+MOVE R8 R1
+CALL R6 2 1
+JUMPIFNOT R6 L1
+MOVE R6 R5
+MOVE R7 R1
+MOVE R8 R2
+CALL R6 2 1
+L1: RETURN R0 0
+)"
+    );
+}
+
+TEST_CASE("InlineNonArgumentConstConditionals")
+{
+    ScopedFastFlag luauCompileCallCostModel{FFlag::LuauCompileCallCostModel, true};
+
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local test = false
+
+local function foo(a)
+    if test then
+        for i = 1,10 do
+            print(table.unpack(table.create(100, i)))
+        end
+    end
+    return a + 42
+end
+
+local x = foo(1)
+return x
+)",
+                   1,
+                   2
+               ),
+        R"(
+DUPCLOSURE R0 K0 ['foo']
+LOADN R1 43
+RETURN R1 1
+)"
+    );
+
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local test = true
+
+local function foo(a)
+    if not test then
+        for i = 1,10 do
+            print(table.unpack(table.create(100, i)))
+        end
+    end
+    return a + 42
+end
+
+local x = foo(1)
+return x
+)",
+                   1,
+                   2
+               ),
+        R"(
+DUPCLOSURE R0 K0 ['foo']
+LOADN R1 43
+RETURN R1 1
+)"
+    );
+
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local test = false
+
+local function foo(a)
+    if not test then
+        return a + 42
+    end
+
+    for i = 1,10 do
+        print(table.unpack(table.create(100, i)))
+    end
+end
+
+local x = foo(1)
+return x
+)",
+                   1,
+                   2
+               ),
+        R"(
+DUPCLOSURE R0 K0 ['foo']
+LOADN R1 43
+RETURN R1 1
+)"
+    );
+}
+
+TEST_CASE("InlineConstConditionals")
+{
+    ScopedFastFlag luauCompileCallCostModel{FFlag::LuauCompileCallCostModel, true};
+    ScopedFastFlag luauCompileStringCharSubFold{FFlag::LuauCompileStringCharSubFold, true};
+
+    // the most expensive part does not participate in cost model if branches are const
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local function foo(a)
+    if a == 1 then
+        return 42
+    elseif a == 2 then
+        return -1
+    else
+        for i = 1,10 do
+            print(table.unpack(table.create(100, i)))
+        end
+    end
+end
+
+local x = foo(1)
+local y = foo(2)
+return x, y
+)",
+                   1,
+                   2
+               ),
+        R"(
+DUPCLOSURE R0 K0 ['foo']
+LOADN R1 42
+LOADN R2 -1
+RETURN R1 2
+)"
+    );
+
+    // constant conditions can be deeply nested
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local function foo(a)
+    local s = 0
+    for i = 1,5 do
+        if a == 1 then
+            s += i
+        elseif a == 2 then
+            s -= i
+        else
+            print(table.unpack(table.create(100, i)))
+        end
+    end
+    return s
+end
+
+local x = foo(1)
+local y = foo(2)
+return x, y
+)",
+                   1,
+                   2
+               ),
+        R"(
+DUPCLOSURE R0 K0 ['foo']
+LOADN R2 0
+ADDK R2 R2 K1 [1]
+ADDK R2 R2 K2 [2]
+ADDK R2 R2 K3 [3]
+ADDK R2 R2 K4 [4]
+ADDK R2 R2 K5 [5]
+MOVE R1 R2
+LOADN R3 0
+SUBK R3 R3 K1 [1]
+SUBK R3 R3 K2 [2]
+SUBK R3 R3 K3 [3]
+SUBK R3 R3 K4 [4]
+SUBK R3 R3 K5 [5]
+MOVE R2 R3
+RETURN R1 2
+)"
+    );
+
+    // works in if-else expressions
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local function foo(a, b, c, d)
+    return if a > 10 then a + b else magic({a, b, c}, {d})
+end
+
+local x = foo(20, 1, 2, 3, 4, 5)
+return x
+)",
+                   1,
+                   2
+               ),
+        R"(
+DUPCLOSURE R0 K0 ['foo']
+LOADN R1 21
+RETURN R1 1
+)"
+    );
+
+    // collapsing long if chains
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local function funnyhex(a)
+    local z = string.byte('0')
+    local set = "0123456789abcdef"
+    if a < 10 then return string.sub(set, a+1, a+1)
+    elseif a < 100 then return `{string.sub(set, (a/10)%10+1, (a/10)%10+1)}{string.sub(set, a%10+1, a%10+1)}`
+    elseif a < 1000 then return `{string.sub(set, (a/100)%10+1, (a/100)%10+1)}{string.sub(set, (a/10)%10+1, (a/10)%10+1)}{string.sub(set, a%10+1, a%10+1)}`
+    elseif a < 10000 then return `{string.sub(set, (a/1000)%10+1, (a/1000)%10+1)}{string.sub(set, (a/100)%10+1, (a/100)%10+1)}{string.sub(set, (a/10)%10+1, (a/10)%10+1)}{string.sub(set, a%10+1, a%10+1)}`
+    elseif a < 100000 then return `{string.sub(set, (a/10000)%10+1, (a/10000)%10+1)}{string.sub(set, (a/1000)%10+1, (a/1000)%10+1)}{string.sub(set, (a/100)%10+1, (a/100)%10+1)}{string.sub(set, (a/10)%10+1, (a/10)%10+1)}{string.sub(set, a%10+1, a%10+1)}`
+    else return tostring(a) end
+end
+
+local a = funnyhex(1)
+local b = funnyhex(24)
+local c = funnyhex(560)
+local d = funnyhex(8943)
+local e = funnyhex(46825)
+return a, b, c, d, e
+)",
+                   1,
+                   2
+               ),
+        R"(
+DUPCLOSURE R0 K0 ['funnyhex']
+LOADK R1 K1 ['1']
+LOADK R2 K2 ['24']
+LOADK R3 K3 ['560']
+LOADK R4 K4 ['8943']
+LOADK R5 K5 ['46825']
+RETURN R1 5
+)"
+    );
+
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local function funnyhex(a)
+    local z = string.byte('0')
+    local set = "0123456789abcdef"
+    if a < 10 then return string.sub(set, a+1, a+1) end
+    if a < 100 then return `{string.sub(set, (a/10)%10+1, (a/10)%10+1)}{string.sub(set, a%10+1, a%10+1)}` end
+    if a < 1000 then return `{string.sub(set, (a/100)%10+1, (a/100)%10+1)}{string.sub(set, (a/10)%10+1, (a/10)%10+1)}{string.sub(set, a%10+1, a%10+1)}` end
+    if a < 10000 then return `{string.sub(set, (a/1000)%10+1, (a/1000)%10+1)}{string.sub(set, (a/100)%10+1, (a/100)%10+1)}{string.sub(set, (a/10)%10+1, (a/10)%10+1)}{string.sub(set, a%10+1, a%10+1)}` end
+    if a < 100000 then return `{string.sub(set, (a/10000)%10+1, (a/10000)%10+1)}{string.sub(set, (a/1000)%10+1, (a/1000)%10+1)}{string.sub(set, (a/100)%10+1, (a/100)%10+1)}{string.sub(set, (a/10)%10+1, (a/10)%10+1)}{string.sub(set, a%10+1, a%10+1)}` end
+    return tostring(a)
+end
+
+local a = funnyhex(1)
+local b = funnyhex(24)
+local c = funnyhex(560)
+local d = funnyhex(8943)
+local e = funnyhex(46825)
+return a, b, c, d, e
+)",
+                   1,
+                   2
+               ),
+        R"(
+DUPCLOSURE R0 K0 ['funnyhex']
+LOADK R1 K1 ['1']
+LOADK R2 K2 ['24']
+LOADK R3 K3 ['560']
+LOADK R4 K4 ['8943']
+LOADK R5 K5 ['46825']
+RETURN R1 5
+)"
+    );
+}
+
+TEST_CASE("InlineLoopIteration")
+{
+    ScopedFastFlag luauCompileCallCostModel{FFlag::LuauCompileCallCostModel, true};
+
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local function foo(a)
+    local s = 0
+    for i = 1,a do
+        s += i
+    end
+    return s
+end
+
+local x = foo(3)
+local y = foo(100)
+return x, y
+)",
+                   1,
+                   2
+               ),
+        R"(
+DUPCLOSURE R0 K0 ['foo']
+LOADN R2 0
+ADDK R2 R2 K1 [1]
+ADDK R2 R2 K2 [2]
+ADDK R2 R2 K3 [3]
+MOVE R1 R2
+MOVE R2 R0
+LOADN R3 100
+CALL R2 1 1
+RETURN R1 2
+)"
+    );
+}
+
+TEST_CASE("InlineOnlyRemoveTerminatingJump")
+{
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local props = {}
+local changes = {}
+
+local function perform(name, valueType, updateFunction)
+    local valueObj = script:FindFirstChild(name)
+
+    if valueObj then
+        props[name] = valueObj.Value
+    else
+        return
+    end
+
+    if updateFunction then
+        changes[name] = valueObj.Changed:Connect(function(newValue)
+            props[name] = newValue
+            updateFunction()
+        end)
+    end
+end
+
+local function performAll()
+    perform("InitialElevation", "NumberValue", nil)
+    perform("InitialDistance", "NumberValue", nil)
+
+    print("done");
+end
+)",
+                   2,
+                   2
+               ),
+        R"(
+GETIMPORT R0 1 [script]
+LOADK R2 K2 ['InitialElevation']
+NAMECALL R0 R0 K3 ['FindFirstChild']
+CALL R0 2 1
+JUMPIFNOT R0 L0
+GETUPVAL R1 0
+GETTABLEKS R2 R0 K4 ['Value']
+SETTABLEKS R2 R1 K2 ['InitialElevation']
+JUMP L0
+JUMP L0
+L0: GETIMPORT R0 1 [script]
+LOADK R2 K5 ['InitialDistance']
+NAMECALL R0 R0 K3 ['FindFirstChild']
+CALL R0 2 1
+JUMPIFNOT R0 L1
+GETUPVAL R1 0
+GETTABLEKS R2 R0 K4 ['Value']
+SETTABLEKS R2 R1 K5 ['InitialDistance']
+JUMP L1
+JUMP L1
+L1: GETIMPORT R0 7 [print]
+LOADK R1 K8 ['done']
+CALL R0 1 0
+RETURN R0 0
+)"
+    );
+}
+
 TEST_CASE("ReturnConsecutive")
 {
     // we can return a single local directly
@@ -7407,6 +8519,8 @@ RETURN R1 -1
 
 TEST_CASE("BuiltinFolding")
 {
+    ScopedFastFlag _[]{{FFlag::LuauCompileMathIsNanInfFinite, true}};
+
     CHECK_EQ(
         "\n" + compileFunction(
                    R"(
@@ -7462,7 +8576,14 @@ return
     bit32.replace(100, 1, 0),
     math.log(100, 10),
     typeof(nil),
-    (type("fin"))
+    type(vector.create(1, 0, 0)),
+    (type("fin")),
+    math.isnan(0/0),
+    math.isnan(0),
+    math.isinf(math.huge),
+    math.isinf(-4),
+    math.isfinite(42),
+    math.isfinite(-math.huge)
 )",
                    0,
                    2
@@ -7519,8 +8640,15 @@ LOADN R47 1
 LOADN R48 101
 LOADN R49 2
 LOADK R50 K3 ['nil']
-LOADK R51 K4 ['string']
-RETURN R0 52
+LOADK R51 K4 ['vector']
+LOADK R52 K5 ['string']
+LOADB R53 1
+LOADB R54 0
+LOADB R55 1
+LOADB R56 0
+LOADB R57 1
+LOADB R58 0
+RETURN R0 59
 )"
     );
 }
@@ -7540,7 +8668,8 @@ return
     bit32.band(1, true),
     bit32.bxor(1, true),
     bit32.btest(1, true),
-    math.min(1, true)
+    math.min(1, true),
+    typeof(vector.create(1, 0, 0))
 )",
                    0,
                    2
@@ -7595,7 +8724,11 @@ FASTCALL2K 19 R10 K3 L9 [true]
 LOADK R11 K3 [true]
 GETIMPORT R9 26 [math.min]
 CALL R9 2 1
-L9: RETURN R0 10
+L9: LOADK R11 K27 [1, 0, 0]
+FASTCALL1 44 R11 L10
+GETIMPORT R10 29 [typeof]
+CALL R10 1 1
+L10: RETURN R0 11
 )"
     );
 }
@@ -7677,6 +8810,39 @@ return math.abs(-42)
         R"(
 LOADN R0 42
 RETURN R0 1
+)"
+    );
+}
+
+TEST_CASE("BuiltinFoldingProhibitedInOptions")
+{
+    Luau::BytecodeBuilder bcb;
+    bcb.setDumpFlags(Luau::BytecodeBuilder::Dump_Code);
+    Luau::CompileOptions options;
+    options.optimizationLevel = 2;
+
+    // math.floor from the test is excluded in this list on purpose
+    static const char* kDisabledBuiltins[] = {"tostring", "math.abs", "math.sqrt", nullptr};
+    options.disabledBuiltins = kDisabledBuiltins;
+
+    Luau::compileOrThrow(bcb, "return math.abs(-42), math.floor(-1.5), math.sqrt(9), (tostring(2))", options);
+
+    std::string result = bcb.dumpFunction(0);
+
+    CHECK_EQ(
+        "\n" + result,
+        R"(
+GETIMPORT R0 2 [math.abs]
+LOADN R1 -42
+CALL R0 1 1
+LOADN R1 -2
+GETIMPORT R2 4 [math.sqrt]
+LOADN R3 9
+CALL R2 1 1
+GETIMPORT R3 6 [tostring]
+LOADN R4 2
+CALL R3 1 1
+RETURN R0 4
 )"
     );
 }
@@ -8417,6 +9583,19 @@ end
     );
 }
 
+TEST_CASE("BuiltinTypeVector")
+{
+    CHECK_EQ(
+        "\n" + compileTypeTable(R"(
+function myfunc(test: Instance, pos: vector)
+end
+)"),
+        R"(
+0: function(userdata, vector)
+)"
+    );
+}
+
 TEST_CASE("TypeAliasScoping")
 {
     CHECK_EQ(
@@ -8498,6 +9677,23 @@ end
 1: function(any, nil)
 2: function(any, nil)
 3: function(any, nil)
+)"
+    );
+}
+
+TEST_CASE("TypeGroup")
+{
+    CHECK_EQ(
+        "\n" + compileTypeTable(R"(
+function myfunc(test: (string), foo: nil)
+end
+
+function myfunc2(test: (string | nil), foo: nil)
+end
+)"),
+        R"(
+0: function(string, nil)
+1: function(string?, nil)
 )"
     );
 }
@@ -8760,6 +9956,8 @@ RETURN R0 0
 
 TEST_CASE("IfElimination")
 {
+    ScopedFastFlag luauCompileCallCostModel{FFlag::LuauCompileCallCostModel, true};
+
     // if the left hand side of a condition is constant, it constant folds and we don't emit the branch
     CHECK_EQ("\n" + compileFunction0("local a = false if a and b then b() end"), R"(
 RETURN R0 0
@@ -8775,7 +9973,6 @@ RETURN R0 0
     CHECK_EQ("\n" + compileFunction0("local a = false if a and b then b() else return 42 end"), R"(
 LOADN R0 42
 RETURN R0 1
-RETURN R0 0
 )");
 
     CHECK_EQ("\n" + compileFunction0("local a = true if a or b then b() else return 42 end"), R"(
@@ -8827,8 +10024,7 @@ RETURN R0 1
 
 TEST_CASE("ArithRevK")
 {
-    // - and / have special optimized form for reverse constants; in the future, + and * will likely get compiled to ADDK/MULK
-    // other operators are not important enough to optimize reverse constant forms for
+    // - and / have special optimized form for reverse constants; in absence of type information, we can't optimize other ops
     CHECK_EQ(
         "\n" + compileFunction0(R"(
 local x: number = unknown
@@ -8849,6 +10045,137 @@ IDIV R6 R7 R0
 LOADN R8 2
 POW R7 R8 R0
 RETURN R1 7
+)"
+    );
+
+    // the same code with type information can optimize commutative operators (+ and *) as well
+    // other operators are not important enough to optimize reverse constant forms for
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local x: number = unknown
+return 2 + x, 2 - x, 2 * x, 2 / x, 2 % x, 2 // x, 2 ^ x
+)",
+                   0,
+                   2,
+                   1
+               ),
+        R"(
+GETIMPORT R0 1 [unknown]
+ADDK R1 R0 K2 [2]
+SUBRK R2 K2 [2] R0
+MULK R3 R0 K2 [2]
+DIVRK R4 K2 [2] R0
+LOADN R6 2
+MOD R5 R6 R0
+LOADN R7 2
+IDIV R6 R7 R0
+LOADN R8 2
+POW R7 R8 R0
+RETURN R1 7
+)"
+    );
+}
+
+TEST_CASE("ConstStringFolding")
+{
+    CHECK_EQ(
+        "\n" + compileFunction(R"(return "" .. "")", 0, 2),
+        R"(
+LOADK R0 K0 ['']
+RETURN R0 1
+)"
+    );
+
+    CHECK_EQ(
+        "\n" + compileFunction(R"(return "a" .. "")", 0, 2),
+        R"(
+LOADK R0 K0 ['a']
+RETURN R0 1
+)"
+    );
+
+    CHECK_EQ(
+        "\n" + compileFunction(R"(return "" .. "a")", 0, 2),
+        R"(
+LOADK R0 K0 ['a']
+RETURN R0 1
+)"
+    );
+
+    CHECK_EQ(
+        "\n" + compileFunction(R"(local hello = "hello"; local world = "world"; return hello .. " " .. world)", 0, 2),
+        R"(
+LOADK R0 K0 ['hello world']
+RETURN R0 1
+)"
+    );
+}
+
+TEST_CASE("StringCharFolding")
+{
+    ScopedFastFlag luauCompileStringCharSubFold{FFlag::LuauCompileStringCharSubFold, true};
+
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local s1 = string.char(49, 50, 51, 52, 53, 54)
+local s2 = string.char()
+local s3 = string.char(0, 0, 0)
+local s4 = string.char(49, 50, 0, 52, 53, 0)
+return s1, s2, s3, s4
+)",
+                   0,
+                   2
+               ),
+        R"(
+LOADK R0 K0 ['123456']
+LOADK R1 K1 ['']
+LOADK R2 K2 ['\x00\x00\x00']
+LOADK R3 K3 ['12\x0045\x00']
+RETURN R0 4
+)"
+    );
+}
+
+TEST_CASE("StringSubFolding")
+{
+    ScopedFastFlag luauCompileStringCharSubFold{FFlag::LuauCompileStringCharSubFold, true};
+
+    CHECK_EQ(
+        "\n" + compileFunction(
+                   R"(
+local s = "123456789"
+
+return
+    string.sub(s, 2, 4),
+    string.sub(s, 7),
+    string.sub(s, 7, 6),
+    string.sub(s, 7, 7),
+    string.sub(s, 0, 0),
+    string.sub(s, -10, 10),
+    string.sub(s, 1, 9),
+    string.sub(s, -10, -20),
+    string.sub(s, -1),
+    string.sub(s, -4),
+    string.sub(s, -6, -4)
+)",
+                   0,
+                   2
+               ),
+        R"(
+LOADK R0 K0 ['234']
+LOADK R1 K1 ['789']
+LOADK R2 K2 ['']
+LOADK R3 K3 ['7']
+LOADK R4 K2 ['']
+LOADK R5 K4 ['123456789']
+LOADK R6 K4 ['123456789']
+LOADK R7 K2 ['']
+LOADK R8 K5 ['9']
+LOADK R9 K6 ['6789']
+LOADK R10 K7 ['456']
+RETURN R0 11
 )"
     );
 }

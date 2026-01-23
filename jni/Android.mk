@@ -18,9 +18,10 @@ LOCAL_C_INCLUDES += $(addprefix $(LOCAL_PATH)/../,VM/src VM/include Common/Inclu
 
 LOCAL_SRC_FILES += $(addsuffix .cpp, \
         $(addprefix ../VM/src/,lapi laux lbaselib lbitlib lbuffer lbuflib lbuiltins lcorolib ldblib ldebug ldo lfunc lgc lgcdebug linit lint64lib liolib lmathlib lmem lnumprint lobject loslib lperf lstate lstring lstrlib \
-         ltable ltablib ltm ludata lutf8lib lvmexecute lvmload lvmutils) \
+         ltable ltablib ltm ludata lutf8lib lveclib lvmexecute lvmload lvmutils) \
         $(addprefix ../Compiler/src/,Builtins BuiltinFolding BytecodeBuilder ConstantFolding Compiler CostModel lcode PseudoCode TableShape Types ValueTracking) \
-        $(addprefix ../Ast/src/,Ast Confusables Lexer Location Parser StringUtils TimeTrace))
+        $(addprefix ../Common/src/,StringUtils TimeTrace) \
+        $(addprefix ../Ast/src/,Allocator Ast Confusables Cst Lexer Location Parser PrettyPrinter))
 
 #CodeGen not yet support for android
 #LOCAL_CFLAGS += -DLUAU_ENABLE_CODEGEN

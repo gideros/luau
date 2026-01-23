@@ -7,6 +7,8 @@
 
 #include <string.h>
 
+LUAU_FASTFLAG(LuauCodegenBufferLoadProp2)
+
 using namespace Luau::CodeGen;
 using namespace Luau::CodeGen::X64;
 
@@ -71,8 +73,8 @@ TEST_CASE_FIXTURE(AssemblyBuilderX64Fixture, "BaseBinaryInstructionForms")
     SINGLE_COMPARE(add(rax, 0x80), 0x48, 0x81, 0xc0, 0x80, 0x00, 0x00, 0x00);
     SINGLE_COMPARE(add(r10, 0x7fffffff), 0x49, 0x81, 0xc2, 0xff, 0xff, 0xff, 0x7f);
     SINGLE_COMPARE(add(al, 3), 0x80, 0xc0, 0x03);
-    SINGLE_COMPARE(add(sil, 3), 0x48, 0x80, 0xc6, 0x03);
-    SINGLE_COMPARE(add(r11b, 3), 0x49, 0x80, 0xc3, 0x03);
+    SINGLE_COMPARE(add(sil, 3), 0x40, 0x80, 0xc6, 0x03);
+    SINGLE_COMPARE(add(r11b, 3), 0x41, 0x80, 0xc3, 0x03);
 
     // reg, [reg]
     SINGLE_COMPARE(add(rax, qword[rax]), 0x48, 0x03, 0x00);
@@ -197,8 +199,8 @@ TEST_CASE_FIXTURE(AssemblyBuilderX64Fixture, "FormsOfMov")
     SINGLE_COMPARE(mov64(rcx, 0x1234567812345678ll), 0x48, 0xb9, 0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12);
     SINGLE_COMPARE(mov(ecx, 2), 0xb9, 0x02, 0x00, 0x00, 0x00);
     SINGLE_COMPARE(mov(cl, 2), 0xb1, 0x02);
-    SINGLE_COMPARE(mov(sil, 2), 0x48, 0xb6, 0x02);
-    SINGLE_COMPARE(mov(r9b, 2), 0x49, 0xb1, 0x02);
+    SINGLE_COMPARE(mov(sil, 2), 0x40, 0xb6, 0x02);
+    SINGLE_COMPARE(mov(r9b, 2), 0x41, 0xb1, 0x02);
     SINGLE_COMPARE(mov(rcx, qword[rdi]), 0x48, 0x8b, 0x0f);
     SINGLE_COMPARE(mov(dword[rax], 0xabcd), 0xc7, 0x00, 0xcd, 0xab, 0x00, 0x00);
     SINGLE_COMPARE(mov(r13, 1), 0x49, 0xbd, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
@@ -209,8 +211,8 @@ TEST_CASE_FIXTURE(AssemblyBuilderX64Fixture, "FormsOfMov")
     SINGLE_COMPARE(mov(qword[rdx], r9), 0x4c, 0x89, 0x0a);
     SINGLE_COMPARE(mov(byte[rsi], 0x3), 0xc6, 0x06, 0x03);
     SINGLE_COMPARE(mov(byte[rsi], al), 0x88, 0x06);
-    SINGLE_COMPARE(mov(byte[rsi], dil), 0x48, 0x88, 0x3e);
-    SINGLE_COMPARE(mov(byte[rsi], r10b), 0x4c, 0x88, 0x16);
+    SINGLE_COMPARE(mov(byte[rsi], dil), 0x40, 0x88, 0x3e);
+    SINGLE_COMPARE(mov(byte[rsi], r10b), 0x44, 0x88, 0x16);
     SINGLE_COMPARE(mov(wordReg(ebx), 0x3a3d), 0x66, 0xbb, 0x3d, 0x3a);
     SINGLE_COMPARE(mov(word[rsi], 0x3a3d), 0x66, 0xc7, 0x06, 0x3d, 0x3a);
     SINGLE_COMPARE(mov(word[rsi], wordReg(eax)), 0x66, 0x89, 0x06);
@@ -220,14 +222,24 @@ TEST_CASE_FIXTURE(AssemblyBuilderX64Fixture, "FormsOfMov")
 
 TEST_CASE_FIXTURE(AssemblyBuilderX64Fixture, "FormsOfMovExtended")
 {
+    ScopedFastFlag luauCodegenBufferLoadProp{FFlag::LuauCodegenBufferLoadProp2, true};
+
     SINGLE_COMPARE(movsx(eax, byte[rcx]), 0x0f, 0xbe, 0x01);
     SINGLE_COMPARE(movsx(r12, byte[r10]), 0x4d, 0x0f, 0xbe, 0x22);
     SINGLE_COMPARE(movsx(ebx, word[r11]), 0x41, 0x0f, 0xbf, 0x1b);
     SINGLE_COMPARE(movsx(rdx, word[rcx]), 0x48, 0x0f, 0xbf, 0x11);
+    SINGLE_COMPARE(movsx(edx, cl), 0x0f, 0xbe, 0xd1);
+    SINGLE_COMPARE(movsx(edx, r12b), 0x41, 0x0f, 0xbe, 0xd4);
+    SINGLE_COMPARE(movsx(edx, wordReg(ecx)), 0x0f, 0xbf, 0xd1);
+    SINGLE_COMPARE(movsx(edx, wordReg(r12d)), 0x41, 0x0f, 0xbf, 0xd4);
     SINGLE_COMPARE(movzx(eax, byte[rcx]), 0x0f, 0xb6, 0x01);
     SINGLE_COMPARE(movzx(r12, byte[r10]), 0x4d, 0x0f, 0xb6, 0x22);
     SINGLE_COMPARE(movzx(ebx, word[r11]), 0x41, 0x0f, 0xb7, 0x1b);
     SINGLE_COMPARE(movzx(rdx, word[rcx]), 0x48, 0x0f, 0xb7, 0x11);
+    SINGLE_COMPARE(movzx(edx, cl), 0x0f, 0xb6, 0xd1);
+    SINGLE_COMPARE(movzx(edx, r12b), 0x41, 0x0f, 0xb6, 0xd4);
+    SINGLE_COMPARE(movzx(edx, wordReg(ecx)), 0x0f, 0xb7, 0xd1);
+    SINGLE_COMPARE(movzx(edx, wordReg(r12d)), 0x41, 0x0f, 0xb7, 0xd4);
 }
 
 TEST_CASE_FIXTURE(AssemblyBuilderX64Fixture, "FormsOfTest")
@@ -238,14 +250,18 @@ TEST_CASE_FIXTURE(AssemblyBuilderX64Fixture, "FormsOfTest")
     SINGLE_COMPARE(test(rcx, 0xabab), 0x48, 0xf7, 0xc1, 0xab, 0xab, 0x00, 0x00);
     SINGLE_COMPARE(test(rcx, rax), 0x48, 0x85, 0xc8);
     SINGLE_COMPARE(test(rax, qword[rcx]), 0x48, 0x85, 0x01);
+    SINGLE_COMPARE(test(al, cl), 0x84, 0xc1);
+    SINGLE_COMPARE(test(al, sil), 0x40, 0x84, 0xc6);
+    SINGLE_COMPARE(test(cl, r12b), 0x41, 0x84, 0xcc);
+    SINGLE_COMPARE(test(sil, dil), 0x40, 0x84, 0xf7);
 }
 
 TEST_CASE_FIXTURE(AssemblyBuilderX64Fixture, "FormsOfShift")
 {
     SINGLE_COMPARE(shl(al, 1), 0xd0, 0xe0);
     SINGLE_COMPARE(shl(al, cl), 0xd2, 0xe0);
-    SINGLE_COMPARE(shl(sil, cl), 0x48, 0xd2, 0xe6);
-    SINGLE_COMPARE(shl(r10b, cl), 0x49, 0xd2, 0xe2);
+    SINGLE_COMPARE(shl(sil, cl), 0x40, 0xd2, 0xe6);
+    SINGLE_COMPARE(shl(r10b, cl), 0x41, 0xd2, 0xe2);
     SINGLE_COMPARE(shr(al, 4), 0xc0, 0xe8, 0x04);
     SINGLE_COMPARE(shr(eax, 1), 0xd1, 0xe8);
     SINGLE_COMPARE(sal(eax, cl), 0xd3, 0xe0);
@@ -268,7 +284,7 @@ TEST_CASE_FIXTURE(AssemblyBuilderX64Fixture, "FormsOfLea")
 TEST_CASE_FIXTURE(AssemblyBuilderX64Fixture, "FormsOfSetcc")
 {
     SINGLE_COMPARE(setcc(ConditionX64::NotEqual, bl), 0x0f, 0x95, 0xc3);
-    SINGLE_COMPARE(setcc(ConditionX64::NotEqual, dil), 0x48, 0x0f, 0x95, 0xc7);
+    SINGLE_COMPARE(setcc(ConditionX64::NotEqual, dil), 0x40, 0x0f, 0x95, 0xc7);
     SINGLE_COMPARE(setcc(ConditionX64::BelowEqual, byte[rcx]), 0x0f, 0x96, 0x01);
 }
 
@@ -504,6 +520,7 @@ TEST_CASE_FIXTURE(AssemblyBuilderX64Fixture, "AVXBinaryInstructionForms")
     SINGLE_COMPARE(vmaxsd(xmm8, xmm10, xmm14), 0xc4, 0x41, 0x2b, 0x5f, 0xc6);
     SINGLE_COMPARE(vminsd(xmm8, xmm10, xmm14), 0xc4, 0x41, 0x2b, 0x5d, 0xc6);
 
+    SINGLE_COMPARE(vcmpeqsd(xmm8, xmm10, xmm14), 0xc4, 0x41, 0x2b, 0xc2, 0xc6, 0x00);
     SINGLE_COMPARE(vcmpltsd(xmm8, xmm10, xmm14), 0xc4, 0x41, 0x2b, 0xc2, 0xc6, 0x01);
 }
 
@@ -573,10 +590,20 @@ TEST_CASE_FIXTURE(AssemblyBuilderX64Fixture, "AVXTernaryInstructionForms")
         vroundsd(xmm8, xmm13, xmmword[r13 + rdx], RoundingModeX64::RoundToPositiveInfinity), 0xc4, 0x43, 0x11, 0x0b, 0x44, 0x15, 0x00, 0x0a
     );
     SINGLE_COMPARE(vroundsd(xmm9, xmm14, xmmword[rcx + r10], RoundingModeX64::RoundToZero), 0xc4, 0x23, 0x09, 0x0b, 0x0c, 0x11, 0x0b);
+
+    SINGLE_COMPARE(vroundps(xmm1, xmm3, RoundingModeX64::RoundToNegativeInfinity), 0xc4, 0xe3, 0x79, 0x08, 0xcb, 0x09);
+    SINGLE_COMPARE(vroundps(xmm12, xmm14, RoundingModeX64::RoundToNegativeInfinity), 0xc4, 0x43, 0x79, 0x08, 0xe6, 0x09);
+    SINGLE_COMPARE(vroundps(xmm12, xmmword[rax + r13], RoundingModeX64::RoundToNegativeInfinity), 0xc4, 0x23, 0x79, 0x08, 0x24, 0x28, 0x09);
+
     SINGLE_COMPARE(vblendvpd(xmm7, xmm12, xmmword[rcx + r10], xmm5), 0xc4, 0xa3, 0x19, 0x4b, 0x3c, 0x11, 0x50);
 
     SINGLE_COMPARE(vpshufps(xmm7, xmm12, xmmword[rcx + r10], 0b11010100), 0xc4, 0xa1, 0x18, 0xc6, 0x3c, 0x11, 0xd4);
     SINGLE_COMPARE(vpinsrd(xmm7, xmm12, xmmword[rcx + r10], 2), 0xc4, 0xa3, 0x19, 0x22, 0x3c, 0x11, 0x02);
+
+    SINGLE_COMPARE(vpextrd(ecx, xmm5, 2), 0xc4, 0xe3, 0x79, 0x16, 0xe9, 0x02);
+    SINGLE_COMPARE(vpextrd(r10d, xmm9, 1), 0xc4, 0x43, 0x79, 0x16, 0xca, 0x01);
+
+    SINGLE_COMPARE(vdpps(xmm7, xmm12, xmmword[rcx + r10], 2), 0xc4, 0xa3, 0x19, 0x40, 0x3c, 0x11, 0x02);
 }
 
 TEST_CASE_FIXTURE(AssemblyBuilderX64Fixture, "MiscInstructions")
@@ -640,9 +667,11 @@ TEST_CASE("LogTest")
     build.imul(rcx, rdx);
     build.imul(rcx, rdx, 8);
     build.vroundsd(xmm1, xmm2, xmm3, RoundingModeX64::RoundToNearestEven);
+    build.vroundps(xmm1, xmm12, RoundingModeX64::RoundToNegativeInfinity);
     build.add(rdx, qword[rcx - 12]);
     build.pop(r12);
     build.cmov(ConditionX64::AboveEqual, rax, rbx);
+    build.vpextrd(ecx, xmm5, 2);
     build.ret();
     build.int3();
 
@@ -686,9 +715,11 @@ TEST_CASE("LogTest")
  imul        rcx,rdx
  imul        rcx,rdx,8
  vroundsd    xmm1,xmm2,xmm3,8
+ vroundps    xmm1,xmm12,9
  add         rdx,qword ptr [rcx-0Ch]
  pop         r12
  cmovae      rax,rbx
+ vpextrd     ecx,xmm5,2
  ret
  int3
  nop

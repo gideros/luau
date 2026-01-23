@@ -6,9 +6,9 @@
 #include "doctest.h"
 #include "Fixture.h"
 
-using namespace Luau;
+LUAU_FASTFLAG(LuauQueryLocalFunctionBinding)
 
-LUAU_FASTFLAG(LuauDocumentationAtPosition)
+using namespace Luau;
 
 struct DocumentationSymbolFixture : BuiltinsFixture
 {
@@ -167,7 +167,6 @@ TEST_CASE_FIXTURE(DocumentationSymbolFixture, "table_overloaded_function_prop")
 
 TEST_CASE_FIXTURE(DocumentationSymbolFixture, "string_metatable_method")
 {
-    ScopedFastFlag sff{FFlag::LuauDocumentationAtPosition, true};
     std::optional<DocumentationSymbol> symbol = getDocSymbol(
         R"(
         local x: string = "Foo"
@@ -181,7 +180,6 @@ TEST_CASE_FIXTURE(DocumentationSymbolFixture, "string_metatable_method")
 
 TEST_CASE_FIXTURE(DocumentationSymbolFixture, "parent_class_method")
 {
-    ScopedFastFlag sff{FFlag::LuauDocumentationAtPosition, true};
     loadDefinition(R"(
         declare class Foo
             function bar(self, x: string): number
@@ -209,7 +207,7 @@ TEST_SUITE_BEGIN("AstQuery");
 
 TEST_CASE_FIXTURE(Fixture, "last_argument_function_call_type")
 {
-    ScopedFastFlag sff{FFlag::LuauSolverV2, false};
+    DOES_NOT_PASS_NEW_SOLVER_GUARD();
 
     check(R"(
 local function foo() return 2 end
@@ -413,12 +411,13 @@ TEST_CASE_FIXTURE(Fixture, "interior_binding_location_is_consistent_with_exterio
 
     LUAU_REQUIRE_NO_ERRORS(result);
 
-    // FIXME CLI-114385: findBindingByPosition does not properly handle AstStatLocalFunction.
+    if (FFlag::LuauQueryLocalFunctionBinding)
+    {
+        std::optional<Binding> declBinding = findBindingAtPosition(*getMainModule(), *getMainSourceModule(), {1, 26});
+        REQUIRE(declBinding);
 
-    // std::optional<Binding> declBinding = findBindingAtPosition(*getMainModule(), *getMainSourceModule(), {1, 26});
-    // REQUIRE(declBinding);
-
-    // CHECK(declBinding->location == Location{{1, 25}, {1, 28}});
+        CHECK(declBinding->location == Location{{1, 23}, {1, 27}});
+    }
 
     std::optional<Binding> innerCallBinding = findBindingAtPosition(*getMainModule(), *getMainSourceModule(), {2, 15});
     REQUIRE(innerCallBinding);

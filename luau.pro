@@ -41,7 +41,7 @@ INCLUDEPATH += \
 
 SOURCES += \
          $$expand(lapi laux lbaselib lbitlib lbuffer lbuflib lbuiltins lcorolib ldblib ldebug ldo lfunc lgc lgcdebug linit lint64lib liolib lmathlib lmem lnumprint lobject loslib lperf lstate lstring lstrlib \
-         ltable ltablib ltm ludata lutf8lib lvmexecute lvmload lvmutils,VM/src/,.cpp) \
+         ltable ltablib ltm ludata lutf8lib lveclib lvmexecute lvmload lvmutils,VM/src/,.cpp) \
          $$expand(Builtins BuiltinFolding BytecodeBuilder ConstantFolding Compiler CostModel lcode PseudoCode TableShape Types ValueTracking,Compiler/src/,.cpp) \
          $$expand(BytecodeAnalysis BytecodeSummary CodeAllocator CodeBlockUnwind CodeGen CodeGenAssembly CodeGenContext CodeGenUtils \
          IrAnalysis IrBuilder IrCallWrapperX64 IrDump IrTranslateBuiltins IrTranslation IrUtils IrValueLocationTracking \
@@ -49,7 +49,8 @@ SOURCES += \
          AssemblyBuilderX64 OptimizeFinalX64 EmitBuiltinsX64 EmitCommonX64 EmitInstructionX64 CodeGenX64 IrLoweringX64 IrRegAllocX64 UnwindBuilderWin \
          AssemblyBuilderA64 CodeGenA64 IrLoweringA64 IrRegAllocA64 UnwindBuilderDwarf2 \
          ,CodeGen/src/,.cpp) \
-         $$expand(Ast Confusables Lexer Location Parser StringUtils TimeTrace,Ast/src/,.cpp)
+         $$expand(StringUtils TimeTrace,Common/src/,.cpp) \
+         $$expand(Allocator Ast Confusables Cst Lexer Location Parser PrettyPrinter,Ast/src/,.cpp)
 
 win32 {
 LIBS += -L"../libgvfs/release" -lgvfs

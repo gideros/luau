@@ -4,7 +4,13 @@
 #include "Luau/Common.h"
 #include "Luau/DenseHash.h"
 
+#include "ConstantFolding.h"
+#include "Utils.h"
+
 #include <limits.h>
+
+LUAU_FASTFLAG(LuauExplicitTypeInstantiationSyntax)
+LUAU_FASTFLAG(LuauCompileCallCostModel)
 
 namespace Luau
 {
@@ -37,25 +43,6 @@ static uint64_t parallelMulSat(uint64_t a, int b)
 
     // the low bits are now correct for values that didn't saturate, and we simply need to mask them if high bit is 1
     return r | (s - (s >> 7));
-}
-
-inline bool getNumber(AstExpr* node, double& result)
-{
-    // since constant model doesn't use constant folding atm, we perform the basic extraction that's sufficient to handle positive/negative literals
-    if (AstExprConstantNumber* ne = node->as<AstExprConstantNumber>())
-    {
-        result = ne->value;
-        return true;
-    }
-
-    if (AstExprUnary* ue = node->as<AstExprUnary>(); ue && ue->op == AstExprUnary::Minus)
-        if (AstExprConstantNumber* ne = ue->expr->as<AstExprConstantNumber>())
-        {
-            result = -ne->value;
-            return true;
-        }
-
-    return false;
 }
 
 struct Cost
@@ -114,23 +101,29 @@ struct Cost
 struct CostVisitor : AstVisitor
 {
     const DenseHashMap<AstExprCall*, int>& builtins;
+    const DenseHashMap<AstExpr*, Constant>& constants;
 
     DenseHashMap<AstLocal*, uint64_t> vars;
     Cost result;
 
-    CostVisitor(const DenseHashMap<AstExprCall*, int>& builtins)
+    CostVisitor(const DenseHashMap<AstExprCall*, int>& builtins, const DenseHashMap<AstExpr*, Constant>& constants)
         : builtins(builtins)
+        , constants(constants)
         , vars(nullptr)
     {
     }
 
     Cost model(AstExpr* node)
     {
+        if (constants.contains(node))
+            return Cost(0, Cost::kLiteral);
+
         if (AstExprGroup* expr = node->as<AstExprGroup>())
         {
             return model(expr->expr);
         }
-        else if (node->is<AstExprConstantNil>() || node->is<AstExprConstantBool>() || node->is<AstExprConstantNumber>() || node->is<AstExprConstantString>())
+        else if (node->is<AstExprConstantNil>() || node->is<AstExprConstantBool>() || node->is<AstExprConstantNumber>() ||
+                 node->is<AstExprConstantString>())
         {
             return Cost(0, Cost::kLiteral);
         }
@@ -224,6 +217,11 @@ struct CostVisitor : AstVisitor
 
             return cost;
         }
+        else if (AstExprInstantiate* expr = node->as<AstExprInstantiate>())
+        {
+            LUAU_ASSERT(FFlag::LuauExplicitTypeInstantiationSyntax);
+            return model(expr->expr);
+        }
         else
         {
             LUAU_ASSERT(!"Unknown expression type");
@@ -269,6 +267,7 @@ struct CostVisitor : AstVisitor
 
         int tripCount = -1;
         double from, to, step = 1;
+
         if (getNumber(node->from, from) && getNumber(node->to, to) && (!node->step || getNumber(node->step, step)))
             tripCount = getTripCount(from, to, step);
 
@@ -303,6 +302,22 @@ struct CostVisitor : AstVisitor
 
     bool visit(AstStatIf* node) override
     {
+        if (FFlag::LuauCompileCallCostModel)
+        {
+            if (isConstantFalse(constants, node->condition))
+            {
+                if (node->elsebody)
+                    node->elsebody->visit(this);
+                return false;
+            }
+
+            if (isConstantTrue(constants, node->condition))
+            {
+                node->thenbody->visit(this);
+                return false;
+            }
+        }
+
         // unconditional 'else' may require a jump after the 'if' body
         // note: this ignores cases when 'then' always terminates and also assumes comparison requires an extra instruction which may be false
         result += 1 + (node->elsebody && !node->elsebody->is<AstStatIf>());
@@ -368,17 +383,67 @@ struct CostVisitor : AstVisitor
 
         return false;
     }
+
+    bool getNumber(AstExpr* node, double& result)
+    {
+        if (const Constant* constant = constants.find(node))
+        {
+            if (constant->type == Constant::Type_Number)
+            {
+                result = constant->valueNumber;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool visit(AstStatBlock* node) override
+    {
+        if (FFlag::LuauCompileCallCostModel)
+        {
+            for (size_t i = 0; i < node->body.size; ++i)
+            {
+                AstStat* stat = node->body.data[i];
+
+                stat->visit(this);
+
+                if (alwaysTerminates(constants, stat))
+                    break;
+            }
+
+            return false;
+        }
+        else
+        {
+            return true;
+        }
+    }
 };
 
-uint64_t modelCost(AstNode* root, AstLocal* const* vars, size_t varCount, const DenseHashMap<AstExprCall*, int>& builtins)
+uint64_t modelCost(
+    AstNode* root,
+    AstLocal* const* vars,
+    size_t varCount,
+    const DenseHashMap<AstExprCall*, int>& builtins,
+    const DenseHashMap<AstExpr*, Constant>& constants
+)
 {
-    CostVisitor visitor{builtins};
+    CostVisitor visitor{builtins, constants};
     for (size_t i = 0; i < varCount && i < 7; ++i)
         visitor.vars[vars[i]] = 0xffull << (i * 8 + 8);
 
     root->visit(&visitor);
 
     return visitor.result.model;
+}
+
+uint64_t modelCost(AstNode* root, AstLocal* const* vars, size_t varCount)
+{
+    DenseHashMap<AstExprCall*, int> builtins{nullptr};
+    DenseHashMap<AstExpr*, Constant> constants{nullptr};
+
+    return modelCost(root, vars, varCount, builtins, constants);
 }
 
 int computeCost(uint64_t model, const bool* varsConst, size_t varCount)

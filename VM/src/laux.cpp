@@ -11,6 +11,8 @@
 
 #include <string.h>
 
+LUAU_FASTFLAG(LuauStacklessPcall)
+
 // convert a stack index to positive
 #define abs_index(L, i) ((i) > 0 || (i) <= LUA_REGISTRYINDEX ? (i) : lua_gettop(L) + (i) + 1)
 
@@ -67,6 +69,7 @@ static l_noret tag_error(lua_State* L, int narg, int tag)
     luaL_typeerrorL(L, narg, lua_typename(L, tag));
 }
 
+// Can be called without stack space reservation
 void luaL_where(lua_State* L, int level)
 {
     lua_Debug ar;
@@ -75,9 +78,12 @@ void luaL_where(lua_State* L, int level)
         lua_pushfstring(L, "%s:%d: ", ar.short_src, ar.currentline);
         return;
     }
+
+    lua_rawcheckstack(L, 1);
     lua_pushliteral(L, ""); // else, no information available...
 }
 
+// Can be called without stack space reservation
 l_noret luaL_errorL(lua_State* L, const char* fmt, ...)
 {
     va_list argp;
@@ -352,6 +358,76 @@ const char* luaL_typename(lua_State* L, int idx)
     const TValue* obj = luaA_toobject(L, idx);
     return obj ? luaT_objtypename(L, obj) : "no value";
 }
+
+int luaL_callyieldable(lua_State* L, int nargs, int nresults)
+{
+    api_check(L, iscfunction(L->ci->func));
+    Closure* cl = clvalue(L->ci->func);
+    api_check(L, cl->c.cont);
+
+    lua_call(L, nargs, nresults);
+
+    if (FFlag::LuauStacklessPcall)
+    {
+        // yielding means we need to propagate yield; resume will call continuation function later
+        if (isyielded(L))
+            return C_CALL_YIELD;
+    }
+    else
+    {
+        if (L->status == LUA_YIELD || L->status == LUA_BREAK)
+            return -1; // -1 is a marker for yielding from C
+    }
+
+    return cl->c.cont(L, LUA_OK, NULL);
+}
+
+void luaL_traceback(lua_State* L, lua_State* L1, const char* msg, int level)
+{
+    api_check(L, level >= 0);
+
+    luaL_Strbuf buf;
+    luaL_buffinit(L, &buf);
+
+    if (msg)
+    {
+        luaL_addstring(&buf, msg);
+        luaL_addstring(&buf, "\n");
+    }
+
+    lua_Debug ar;
+    for (int i = level; lua_getinfo(L1, i, "sln", &ar); ++i)
+    {
+        if (strcmp(ar.what, "C") == 0)
+            continue;
+
+        if (ar.source)
+            luaL_addstring(&buf, ar.short_src);
+
+        if (ar.currentline > 0)
+        {
+            char line[32]; // manual conversion for performance
+            char* lineend = line + sizeof(line);
+            char* lineptr = lineend;
+            for (unsigned int r = ar.currentline; r > 0; r /= 10)
+                *--lineptr = '0' + (r % 10);
+
+            luaL_addchar(&buf, ':');
+            luaL_addlstring(&buf, lineptr, lineend - lineptr);
+        }
+
+        if (ar.name)
+        {
+            luaL_addstring(&buf, " function ");
+            luaL_addstring(&buf, ar.name);
+        }
+
+        luaL_addchar(&buf, '\n');
+    }
+
+    luaL_pushresult(&buf);
+}
+
 
 /*
 ** {======================================================

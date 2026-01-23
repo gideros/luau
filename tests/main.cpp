@@ -1,6 +1,8 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/Common.h"
 
+#include "Luau/CodeGenCommon.h"
+
 #define DOCTEST_CONFIG_IMPLEMENT
 // Our calls to parseOption/parseFlag don't provide a prefix so set the prefix to the empty string.
 #define DOCTEST_CONFIG_OPTIONS_PREFIX ""
@@ -27,12 +29,11 @@
 #include <sys/sysctl.h>
 #endif
 
-#include <limits> // TODO: remove with LuauTypeSolverRelease
+#include <fstream>
+#include <iostream>
 #include <optional>
 
 #include <stdio.h>
-
-LUAU_DYNAMIC_FASTINT(LuauTypeSolverRelease)
 
 // Indicates if verbose output is enabled; can be overridden via --verbose
 // Currently, this enables output from 'print', but other verbose output could be enabled eventually.
@@ -53,9 +54,6 @@ static bool skipFastFlag(const char* flagName)
         return true;
 
     if (strncmp(flagName, "Debug", 5) == 0)
-        return true;
-
-    if (strcmp(flagName, "StudioReportLuauAny2") == 0)
         return true;
 
     return false;
@@ -415,12 +413,6 @@ int main(int argc, char** argv)
         printf("Using RNG seed %u\n", *randomSeed);
     }
 
-    // New Luau type solver uses a temporary scheme where fixes are made under a single version flag
-    // When flags are enabled, new solver is enabled with all new features and fixes
-    // When it's disabled, this value should have no effect (all uses under a new solver)
-    // Flag setup argument can still be used to override this to a specific value if desired
-    DFInt::LuauTypeSolverRelease.value = std::numeric_limits<int>::max();
-
     if (std::vector<doctest::String> flags; doctest::parseCommaSepArgs(argc, argv, "--fflags=", flags))
         setFastFlags(flags);
 
@@ -433,6 +425,16 @@ int main(int argc, char** argv)
     doctest::String filter;
     if (doctest::parseOption(argc, argv, "--run_test", &filter) && filter[0] == '=')
     {
+        if (doctest::parseOption(argc, argv, "--run_suites_in_file"))
+        {
+            fprintf(stderr, "ERROR: Cannot pass both --run_test and --run_suites_in_file\n");
+            return 1;
+        }
+        if (doctest::parseOption(argc, argv, "--run_cases_in_file"))
+        {
+            fprintf(stderr, "ERROR: Cannot pass both --run_test and --run_cases_in_file\n");
+            return 1;
+        }
         const char* f = filter.c_str() + 1;
         const char* s = strchr(f, '/');
 
@@ -445,6 +447,28 @@ int main(int argc, char** argv)
         {
             context.addFilter("test-suite", f);
         }
+    }
+
+    doctest::String suite_filter_path;
+    if (doctest::parseOption(argc, argv, "--run_suites_in_file", &suite_filter_path) && suite_filter_path[0] == '=')
+    {
+        const char* filter_file = suite_filter_path.c_str() + 1;
+        std::ifstream filter_stream(filter_file);
+        std::stringstream buffer;
+        buffer << filter_stream.rdbuf();
+        std::string suite_list = buffer.str();
+        context.addFilter("test-suite", suite_list.c_str());
+    }
+
+    doctest::String case_filter_path;
+    if (doctest::parseOption(argc, argv, "--run_cases_in_file", &case_filter_path) && case_filter_path[0] == '=')
+    {
+        const char* filter_file = case_filter_path.c_str() + 1;
+        std::ifstream filter_stream(filter_file);
+        std::stringstream buffer;
+        buffer << filter_stream.rdbuf();
+        std::string case_list = buffer.str();
+        context.addFilter("test-path", case_list.c_str());
     }
 
     // These callbacks register unit tests that need runtime support to be

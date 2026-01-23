@@ -6,9 +6,6 @@
 #include "lstate.h"
 #include "lvm.h"
 
-LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauCoroCheckStack, false)
-LUAU_DYNAMIC_FASTFLAG(LuauStackLimit)
-
 #define CO_STATUS_ERROR -1
 #define CO_STATUS_BREAK -2
 
@@ -41,7 +38,7 @@ static int auxresume(lua_State* L, lua_State* co, int narg)
             luaL_error(L, "too many arguments to resume");
         lua_xmove(L, co, narg);
     }
-    else if (DFFlag::LuauCoroCheckStack)
+    else
     {
         // coroutine might be completely full already
         if ((co->top - co->base) > LUAI_MAXCSTACK)
@@ -238,20 +235,12 @@ static int coclose(lua_State* L)
     {
         lua_pushboolean(L, false);
 
-        if (DFFlag::LuauStackLimit)
-        {
-            if (co->status == LUA_ERRMEM)
-                lua_pushstring(L, LUA_MEMERRMSG);
-            else if (co->status == LUA_ERRERR)
-                lua_pushstring(L, LUA_ERRERRMSG);
-            else if (lua_gettop(co))
-                lua_xmove(co, L, 1); // move error message
-        }
-        else
-        {
-            if (lua_gettop(co))
-                lua_xmove(co, L, 1); // move error message
-        }
+        if (co->status == LUA_ERRMEM)
+            lua_pushstring(L, LUA_MEMERRMSG);
+        else if (co->status == LUA_ERRERR)
+            lua_pushstring(L, LUA_ERRERRMSG);
+        else if (lua_gettop(co))
+            lua_xmove(co, L, 1); // move error message
 
         lua_resetthread(co);
         return 2;

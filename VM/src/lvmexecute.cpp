@@ -17,7 +17,7 @@
 #include <string.h>
 #include <math.h>
 
-// Disable c99-designator to avoid the warning in CGOTO dispatch table
+// Disable c99-designator to avoid the warning in computed goto dispatch table
 #ifdef __clang__
 #if __has_warning("-Wc99-designator")
 #pragma clang diagnostic ignored "-Wc99-designator"
@@ -33,7 +33,7 @@
 // ra/rb/rc!
 // 4. When copying an object to any existing object as a field, generally speaking you need to call luaC_barrier! Be careful with all setobj calls
 // 5. To make 4 easier to follow, please use setobj2s for copies to stack, setobj2t for writes to tables, and setobj for other copies.
-// 6. You can define HARDSTACKTESTS in llimits.h which will aggressively realloc stack; with address sanitizer this should be effective at finding
+// 6. You can define HARDSTACKTESTS in luaconf.h which will aggressively realloc stack; with address sanitizer this should be effective at finding
 // stack corruption bugs
 // 7. Many external Lua functions can call GC! GC will *not* traverse pointers to new objects that aren't reachable from Lua root. Be careful when
 // creating new Lua objects, store them to stack soon.
@@ -145,24 +145,26 @@ LUAU_NOINLINE void luau_callhook(lua_State* L, lua_Hook hook, void* userdata)
     ptrdiff_t ci_top = savestack(L, L->ci->top);
     int status = L->status;
 
-    // if the hook is called externally on a paused thread, we need to make sure the paused thread can emit Lua calls
+    // if the hook is called externally on a paused thread, we need to make sure the paused thread can emit Luau calls
     if (status == LUA_YIELD || status == LUA_BREAK)
     {
         L->status = 0;
         L->base = L->ci->base;
     }
 
+    Closure* cl = clvalue(L->ci->func);
+
     // note: the pc expectations of the hook are matching the general "pc points to next instruction"
     // however, for the hook to be able to continue execution from the same point, this is called with savedpc at the *current* instruction
     // this needs to be called before luaD_checkstack in case it fails to reallocate stack
-    if (L->ci->savedpc)
+    const Instruction* oldsavedpc = L->ci->savedpc;
+
+    if (L->ci->savedpc && L->ci->savedpc != cl->l.p->code + cl->l.p->sizecode)
         L->ci->savedpc++;
 
     luaD_checkstack(L, LUA_MINSTACK); // ensure minimum stack size
     L->ci->top = L->top + LUA_MINSTACK;
     LUAU_ASSERT(L->ci->top <= L->stack_last);
-
-    Closure* cl = clvalue(L->ci->func);
 
     lua_Debug ar;
     ar.currentline = cl->isC ? -1 : luaG_getline(cl->l.p, pcRel(L->ci->savedpc, cl->l.p));
@@ -170,8 +172,7 @@ LUAU_NOINLINE void luau_callhook(lua_State* L, lua_Hook hook, void* userdata)
 
     hook(L, &ar);
 
-    if (L->ci->savedpc)
-        L->ci->savedpc--;
+    L->ci->savedpc = oldsavedpc;
 
     L->ci->top = restorestack(L, ci_top);
     L->top = restorestack(L, top);
@@ -336,7 +337,7 @@ reentry:
                 LUAU_ASSERT(ttisstring(kv));
 
                 // fast-path: value is in expected slot
-                Table* h = cl->env;
+                LuaTable* h = cl->env;
                 int slot = LUAU_INSN_C(insn) & h->nodemask8;
                 LuaNode* n = &h->node[slot];
 
@@ -367,7 +368,7 @@ reentry:
                 LUAU_ASSERT(ttisstring(kv));
 
                 // fast-path: value is in expected slot
-                Table* h = cl->env;
+                LuaTable* h = cl->env;
                 int slot = LUAU_INSN_C(insn) & h->nodemask8;
                 LuaNode* n = &h->node[slot];
 
@@ -457,9 +458,8 @@ reentry:
                 // fast-path: built-in table
                 if (LUAU_LIKELY(ttistable(rb)))
                 {
-                    Table* h = hvalue(rb);
+					LuaTable* h = hvalue(rb);
                     lualock_table(h);
-
 
                     int slot = LUAU_INSN_C(insn) & h->nodemask8;
                     LuaNode* n = &h->node[slot];
@@ -609,8 +609,8 @@ reentry:
                 // fast-path: built-in table
                 if (LUAU_LIKELY(ttistable(rb)))
                 {
-                    Table* h = hvalue(rb);
-                    lualock_table(h);
+                    LuaTable* h = hvalue(rb);
+					lualock_table(h);
 
                     int slot = LUAU_INSN_C(insn) & h->nodemask8;
                     LuaNode* n = &h->node[slot];
@@ -765,13 +765,13 @@ reentry:
                 // fast-path: array lookup
                 if (ttistable(rb) && ttisnumber(rc))
                 {
-                    Table* h = hvalue(rb);
+                    LuaTable* h = hvalue(rb);
 
                     double indexd = nvalue(rc);
                     int index = int(indexd);
 
                     // index has to be an exact integer and in-bounds for the array portion
-                    if (LUAU_LIKELY(unsigned(index - 1) < unsigned(h->sizearray) && !h->metatable && double(index) == indexd))
+                    if (LUAU_LIKELY(unsigned(index) - 1 < unsigned(h->sizearray) && !h->metatable && double(index) == indexd))
                     {
                         setobj2s(L, ra, &h->array[unsigned(index - 1)]);
                         VM_NEXT();
@@ -821,13 +821,13 @@ reentry:
                 // fast-path: array assign
                 if (ttistable(rb) && ttisnumber(rc))
                 {
-                    Table* h = hvalue(rb);
+                    LuaTable* h = hvalue(rb);
 
                     double indexd = nvalue(rc);
                     int index = int(indexd);
 
                     // index has to be an exact integer and in-bounds for the array portion
-                    if (LUAU_LIKELY(unsigned(index - 1) < unsigned(h->sizearray) && !h->metatable && !h->readonly && double(index) == indexd))
+                    if (LUAU_LIKELY(unsigned(index) - 1 < unsigned(h->sizearray) && !h->metatable && !h->readonly && double(index) == indexd))
                     {
                         setobj2t(L, &h->array[unsigned(index - 1)], ra);
                         luaC_barriert(L, h, ra);
@@ -878,7 +878,7 @@ reentry:
                 // fast-path: array lookup
                 if (ttistable(rb))
                 {
-                    Table* h = hvalue(rb);
+                    LuaTable* h = hvalue(rb);
 
                     if (LUAU_LIKELY(unsigned(c) < unsigned(h->sizearray) && !h->metatable))
                     {
@@ -918,7 +918,7 @@ reentry:
                 // fast-path: array assign
                 if (ttistable(rb))
                 {
-                    Table* h = hvalue(rb);
+                    LuaTable* h = hvalue(rb);
 
                     if (LUAU_LIKELY(unsigned(c) < unsigned(h->sizearray) && !h->metatable && !h->readonly))
                     {
@@ -1004,7 +1004,7 @@ reentry:
 
                 if (LUAU_LIKELY(ttistable(rb)))
                 {
-                    Table* h = hvalue(rb);
+                    LuaTable* h = hvalue(rb);
                     // note: we can't use nodemask8 here because we need to query the main position of the table, and 8-bit nodemask8 only works
                     // for predictive lookups
                     LuaNode* n = &h->node[tsvalue(kv)->hash & (sizenode(h) - 1)];
@@ -1044,7 +1044,7 @@ reentry:
                 }
                 else
                 {
-                    Table* mt = ttisuserdata(rb) ? uvalue(rb)->metatable : L->global->mt[ttype(rb)];
+                    LuaTable* mt = ttisuserdata(rb) ? uvalue(rb)->metatable : L->global->mt[ttype(rb)];
                     const TValue* tmi = 0;
 
                     // fast-path: metatable with __namecall
@@ -1058,7 +1058,7 @@ reentry:
                     }
                     else if ((tmi = fasttm(L, mt, TM_INDEX)) && ttistable(tmi))
                     {
-                        Table* h = hvalue(tmi);
+                        LuaTable* h = hvalue(tmi);
                         int slot = LUAU_INSN_C(insn) & h->nodemask8;
                         LuaNode* n = &h->node[slot];
 
@@ -1140,7 +1140,7 @@ reentry:
                 // note: this reallocs stack, but we don't need to VM_PROTECT this
                 // this is because we're going to modify base/savedpc manually anyhow
                 // crucially, we can't use ra/argtop after this line
-                luaD_checkstack(L, ccl->stacksize);
+                luaD_checkstackfornewci(L, ccl->stacksize);
 
                 LUAU_ASSERT(ci->top <= L->stack_last);
 
@@ -2354,7 +2354,7 @@ reentry:
                 // fast-path #1: tables
                 if (LUAU_LIKELY(ttistable(rb)))
                 {
-                    Table* h = hvalue(rb);
+					LuaTable* h = hvalue(rb);
                     lualock_table(h);
 
                     if (fastnotm(h->metatable, TM_LEN))
@@ -2400,7 +2400,7 @@ reentry:
                 uint32_t aux = *pc++;
 
 				VM_PROTECT_PC(); // luaH_new may fail due to OOM
-                Table *tnew = luaH_new(L, aux, b == 0 ? 0 : (1 << (b - 1)));
+				LuaTable *tnew = luaH_new(L, aux, b == 0 ? 0 : (1 << (b - 1)));
                 sethvalue(L, ra, tnew);
                 profiletable(L, tnew, pc);
                 if (L->profileTableAllocs)
@@ -2417,7 +2417,7 @@ reentry:
 
 				VM_PROTECT_PC(); // luaH_clone may fail due to OOM
                 lualock_table(hvalue(kv));
-                Table *tnew = luaH_clone(L, hvalue(kv));
+                LuaTable *tnew = luaH_clone(L, hvalue(kv));
                 sethvalue(L, ra, tnew);
                 luaunlock_table(hvalue(kv));
                 profiletable(L, tnew, pc);
@@ -2441,7 +2441,7 @@ reentry:
                     L->top = L->ci->top;
                 }
 
-                Table* h = hvalue(ra);
+                LuaTable* h = hvalue(ra);
 
                 // TODO: we really don't need this anymore
                 if (!ttistable(ra))
@@ -2528,7 +2528,7 @@ reentry:
                 }
                 else
                 {
-                    Table* mt = ttistable(ra) ? hvalue(ra)->metatable : ttisuserdata(ra) ? uvalue(ra)->metatable : cast_to(Table*, NULL);
+                    LuaTable* mt = ttistable(ra) ? hvalue(ra)->metatable : ttisuserdata(ra) ? uvalue(ra)->metatable : cast_to(LuaTable*, NULL);
 
                     if (const TValue* fn = fasttm(L, mt, TM_ITER))
                     {
@@ -2587,7 +2587,7 @@ reentry:
                 // TODO: remove the table check per guarantee above
                 if (ttisnil(ra) && ttistable(ra + 1))
                 {
-                    Table* h = hvalue(ra + 1);
+                    LuaTable* h = hvalue(ra + 1);
                     int index = int(reinterpret_cast<uintptr_t>(pvalue(ra + 2)));
 
                     int sizearray = h->sizearray;
@@ -3159,8 +3159,8 @@ reentry:
                 int skip = LUAU_INSN_C(insn) - 1;
                 uint32_t aux = *pc++;
                 TValue* arg1 = VM_REG(LUAU_INSN_B(insn));
-                TValue* arg2 = VM_REG(aux & 0xff);
-                TValue* arg3 = VM_REG((aux >> 8) & 0xff);
+                TValue* arg2 = VM_REG(LUAU_INSN_AUX_A(aux));
+                TValue* arg3 = VM_REG(LUAU_INSN_AUX_B(aux));
 
                 LUAU_ASSERT(unsigned(pc - cl->l.p->code + skip) < unsigned(cl->l.p->sizecode));
 
@@ -3179,10 +3179,13 @@ reentry:
                 {
                     VM_PROTECT_PC(); // f may fail due to OOM
 
-                    setobj2s(L, L->top, arg2);
-                    setobj2s(L, L->top + 1, arg3);
+                    // note: it's safe to push arguments past top for complicated reasons (see top of the file)
+                    LUAU_ASSERT(L->top + 2 < L->stack + L->stacksize);
+                    StkId top = L->top;
+                    setobj2s(L, top, arg2);
+                    setobj2s(L, top + 1, arg3);
 
-                    int n = f(L, ra, arg1, nresults, L->top, nparams);
+                    int n = f(L, ra, arg1, nresults, top, nparams);
 
                     if (n >= 0)
                     {
@@ -3574,7 +3577,7 @@ reentry:
                 StkId ra = VM_REG(LUAU_INSN_A(insn));
 
                 static_assert(LUA_TNIL == 0, "we expect type-1 to be negative iff type is nil");
-                // condition is equivalent to: int(ttisnil(ra)) != (aux >> 31)
+                // condition is equivalent to: int(ttisnil(ra)) != LUAU_INSN_AUX_NOT(aux)
                 pc += int((ttype(ra) - 1) ^ aux) < 0 ? LUAU_INSN_D(insn) : 1;
                 LUAU_ASSERT(unsigned(pc - cl->l.p->code) < unsigned(cl->l.p->sizecode));
                 VM_NEXT();
@@ -3586,7 +3589,7 @@ reentry:
                 uint32_t aux = *pc;
                 StkId ra = VM_REG(LUAU_INSN_A(insn));
 
-                pc += int(ttisboolean(ra) && bvalue(ra) == int(aux & 1)) != (aux >> 31) ? LUAU_INSN_D(insn) : 1;
+                pc += int(ttisboolean(ra) && bvalue(ra) == int(LUAU_INSN_AUX_KB(aux))) != LUAU_INSN_AUX_NOT(aux) ? LUAU_INSN_D(insn) : 1;
                 LUAU_ASSERT(unsigned(pc - cl->l.p->code) < unsigned(cl->l.p->sizecode));
                 VM_NEXT();
             }
@@ -3596,18 +3599,18 @@ reentry:
                 Instruction insn = *pc++;
                 uint32_t aux = *pc;
                 StkId ra = VM_REG(LUAU_INSN_A(insn));
-                TValue* kv = VM_KV(aux & 0xffffff);
+                TValue* kv = VM_KV(LUAU_INSN_AUX_KV(aux));
                 LUAU_ASSERT(ttisnumber(kv));
 
 #if defined(__aarch64__)
                 // On several ARM chips (Apple M1/M2, Neoverse N1), comparing the result of a floating-point comparison is expensive, and a branch
                 // is much cheaper; on some 32-bit ARM chips (Cortex A53) the performance is about the same so we prefer less branchy variant there
-                if (aux >> 31)
+                if (LUAU_INSN_AUX_NOT(aux))
                     pc += !(ttisnumber(ra) && nvalue(ra) == nvalue(kv)) ? LUAU_INSN_D(insn) : 1;
                 else
                     pc += (ttisnumber(ra) && nvalue(ra) == nvalue(kv)) ? LUAU_INSN_D(insn) : 1;
 #else
-                pc += int(ttisnumber(ra) && nvalue(ra) == nvalue(kv)) != (aux >> 31) ? LUAU_INSN_D(insn) : 1;
+                pc += int(ttisnumber(ra) && nvalue(ra) == nvalue(kv)) != LUAU_INSN_AUX_NOT(aux) ? LUAU_INSN_D(insn) : 1;
 #endif
                 LUAU_ASSERT(unsigned(pc - cl->l.p->code) < unsigned(cl->l.p->sizecode));
                 VM_NEXT();
@@ -3618,10 +3621,10 @@ reentry:
                 Instruction insn = *pc++;
                 uint32_t aux = *pc;
                 StkId ra = VM_REG(LUAU_INSN_A(insn));
-                TValue* kv = VM_KV(aux & 0xffffff);
+                TValue* kv = VM_KV(LUAU_INSN_AUX_KV(aux));
                 LUAU_ASSERT(ttisstring(kv));
 
-                pc += int(ttisstring(ra) && gcvalue(ra) == gcvalue(kv)) != (aux >> 31) ? LUAU_INSN_D(insn) : 1;
+                pc += int(ttisstring(ra) && gcvalue(ra) == gcvalue(kv)) != LUAU_INSN_AUX_NOT(aux) ? LUAU_INSN_D(insn) : 1;
                 LUAU_ASSERT(unsigned(pc - cl->l.p->code) < unsigned(cl->l.p->sizecode));
                 VM_NEXT();
             }
@@ -3666,7 +3669,7 @@ int luau_precall(lua_State* L, StkId func, int nresults)
     L->base = ci->base;
     // Note: L->top is assigned externally
 
-    luaD_checkstack(L, ccl->stacksize);
+    luaD_checkstackfornewci(L, ccl->stacksize);
     LUAU_ASSERT(ci->top <= L->stack_last);
 
     if (!ccl->isC)

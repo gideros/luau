@@ -10,8 +10,6 @@
 #include "Type.h"
 
 LUAU_FASTINT(LuauVisitRecursionLimit)
-LUAU_FASTFLAG(LuauBoundLazyTypes2)
-LUAU_FASTFLAG(LuauSolverV2)
 
 namespace Luau
 {
@@ -73,6 +71,8 @@ struct GenericTypeVisitor
 {
     using Set = S;
 
+    const std::string visitorName;
+
     Set seen;
     bool skipBoundTypes = false;
     int recursionCounter = 0;
@@ -80,11 +80,14 @@ struct GenericTypeVisitor
 
     GenericTypeVisitor() = default;
 
-    explicit GenericTypeVisitor(Set seen, bool skipBoundTypes = false)
-        : seen(std::move(seen))
+    explicit GenericTypeVisitor(const std::string visitorName, Set seen, bool skipBoundTypes = false)
+        : visitorName(visitorName)
+        , seen(std::move(seen))
         , skipBoundTypes(skipBoundTypes)
     {
     }
+
+    virtual ~GenericTypeVisitor() {}
 
     virtual void cycle(TypeId) {}
     virtual void cycle(TypePackId) {}
@@ -125,7 +128,7 @@ struct GenericTypeVisitor
     {
         return visit(ty);
     }
-    virtual bool visit(TypeId ty, const ClassType& ctv)
+    virtual bool visit(TypeId ty, const ExternType& etv)
     {
         return visit(ty);
     }
@@ -190,7 +193,7 @@ struct GenericTypeVisitor
     {
         return visit(tp);
     }
-    virtual bool visit(TypePackId tp, const Unifiable::Error& etp)
+    virtual bool visit(TypePackId tp, const ErrorTypePack& etp)
     {
         return visit(tp);
     }
@@ -213,7 +216,21 @@ struct GenericTypeVisitor
 
     void traverse(TypeId ty)
     {
-        RecursionLimiter limiter{&recursionCounter, FInt::LuauVisitRecursionLimit};
+        // Morally, if `skipBoundTypes` is set, then whenever we
+        // encounter a bound type we should "skip" ahead to the first
+        // non-bound type. This helps keep stack pressure in check
+        // while using bound types instead of mutating types in place
+        // elsewhere (such as in generalization).
+        //
+        // We do this check here such that we now will now treat all
+        // bound types as if they're direct pointers to some final
+        // non-bound type. If we do the check later, then we might
+        // get slightly different behavior depending on the exact
+        // entry point for cyclic types.
+        if (is<BoundType>(ty) && skipBoundTypes)
+            ty = follow(ty);
+
+        RecursionLimiter limiter{visitorName, &recursionCounter, FInt::LuauVisitRecursionLimit};
 
         if (visit_detail::hasSeen(seen, ty))
         {
@@ -223,31 +240,24 @@ struct GenericTypeVisitor
 
         if (auto btv = get<BoundType>(ty))
         {
-            if (skipBoundTypes)
-                traverse(btv->boundTo);
-            else if (visit(ty, *btv))
+            // At this point, we know that `skipBoundTypes` is false, as
+            // otherwise we would have hit the above branch.
+            LUAU_ASSERT(!skipBoundTypes);
+            if (visit(ty, *btv))
                 traverse(btv->boundTo);
         }
         else if (auto ftv = get<FreeType>(ty))
         {
-            if (FFlag::LuauSolverV2)
+            if (visit(ty, *ftv))
             {
-                if (visit(ty, *ftv))
-                {
-                    // TODO: Replace these if statements with assert()s when we
-                    // delete FFlag::LuauSolverV2.
-                    //
-                    // When the old solver is used, these pointers are always
-                    // unused. When the new solver is used, they are never null.
-                    if (ftv->lowerBound)
-                        traverse(ftv->lowerBound);
+                // Regardless of the choice of solver, all free types are guaranteed to have
+                // lower and upper bounds
+                LUAU_ASSERT(ftv->lowerBound);
+                LUAU_ASSERT(ftv->upperBound);
 
-                    if (ftv->upperBound)
-                        traverse(ftv->upperBound);
-                }
+                traverse(ftv->lowerBound);
+                traverse(ftv->upperBound);
             }
-            else
-                visit(ty, *ftv);
         }
         else if (auto gtv = get<GenericType>(ty))
             visit(ty, *gtv);
@@ -280,20 +290,15 @@ struct GenericTypeVisitor
                 {
                     for (auto& [_name, prop] : ttv->props)
                     {
-                        if (FFlag::LuauSolverV2)
-                        {
-                            if (auto ty = prop.readTy)
-                                traverse(*ty);
+                        if (auto ty = prop.readTy)
+                            traverse(*ty);
 
-                            // In the case that the readType and the writeType
-                            // are the same pointer, just traverse once.
-                            // Traversing each property twice has pretty
-                            // significant performance consequences.
-                            if (auto ty = prop.writeTy; ty && !prop.isShared())
-                                traverse(*ty);
-                        }
-                        else
-                            traverse(prop.type());
+                        // In the case that the readType and the writeType
+                        // are the same pointer, just traverse once.
+                        // Traversing each property twice has pretty
+                        // significant performance consequences.
+                        if (auto ty = prop.writeTy; ty && !prop.isShared())
+                            traverse(*ty);
                     }
 
                     if (ttv->indexer)
@@ -312,38 +317,33 @@ struct GenericTypeVisitor
                 traverse(mtv->metatable);
             }
         }
-        else if (auto ctv = get<ClassType>(ty))
+        else if (auto etv = get<ExternType>(ty))
         {
-            if (visit(ty, *ctv))
+            if (visit(ty, *etv))
             {
-                for (const auto& [name, prop] : ctv->props)
+                for (const auto& [name, prop] : etv->props)
                 {
-                    if (FFlag::LuauSolverV2)
-                    {
-                        if (auto ty = prop.readTy)
-                            traverse(*ty);
+                    if (auto ty = prop.readTy)
+                        traverse(*ty);
 
-                        // In the case that the readType and the writeType are
-                        // the same pointer, just traverse once. Traversing each
-                        // property twice would have pretty significant
-                        // performance consequences.
-                        if (auto ty = prop.writeTy; ty && !prop.isShared())
-                            traverse(*ty);
-                    }
-                    else
-                        traverse(prop.type());
+                    // In the case that the readType and the writeType are
+                    // the same pointer, just traverse once. Traversing each
+                    // property twice would have pretty significant
+                    // performance consequences.
+                    if (auto ty = prop.writeTy; ty && !prop.isShared())
+                        traverse(*ty);
                 }
 
-                if (ctv->parent)
-                    traverse(*ctv->parent);
+                if (etv->parent)
+                    traverse(*etv->parent);
 
-                if (ctv->metatable)
-                    traverse(*ctv->metatable);
+                if (etv->metatable)
+                    traverse(*etv->metatable);
 
-                if (ctv->indexer)
+                if (etv->indexer)
                 {
-                    traverse(ctv->indexer->indexType);
-                    traverse(ctv->indexer->indexResultType);
+                    traverse(etv->indexer->indexType);
+                    traverse(etv->indexer->indexResultType);
                 }
             }
         }
@@ -395,7 +395,7 @@ struct GenericTypeVisitor
                 traverse(unwrapped);
 
             // Visiting into LazyType that hasn't been unwrapped may necessarily cause infinite expansion, so we don't do that on purpose.
-            // Asserting also makes no sense, because the type _will_ happen here, most likely as a property of some ClassType
+            // Asserting also makes no sense, because the type _will_ happen here, most likely as a property of some ExternType
             // that doesn't need to be expanded.
         }
         else if (auto stv = get<SingletonType>(ty))
@@ -461,7 +461,7 @@ struct GenericTypeVisitor
         else if (auto gtv = get<GenericTypePack>(tp))
             visit(tp, *gtv);
 
-        else if (auto etv = get<Unifiable::Error>(tp))
+        else if (auto etv = get<ErrorTypePack>(tp))
             visit(tp, *etv);
 
         else if (auto pack = get<TypePack>(tp))
@@ -512,8 +512,8 @@ struct GenericTypeVisitor
  */
 struct TypeVisitor : GenericTypeVisitor<std::unordered_set<void*>>
 {
-    explicit TypeVisitor(bool skipBoundTypes = false)
-        : GenericTypeVisitor{{}, skipBoundTypes}
+    explicit TypeVisitor(const std::string visitorName, bool skipBoundTypes)
+        : GenericTypeVisitor{visitorName, {}, skipBoundTypes}
     {
     }
 };
@@ -521,8 +521,8 @@ struct TypeVisitor : GenericTypeVisitor<std::unordered_set<void*>>
 /// Visit each type under a given type.  Each type will only be checked once even if there are multiple paths to it.
 struct TypeOnceVisitor : GenericTypeVisitor<DenseHashSet<void*>>
 {
-    explicit TypeOnceVisitor(bool skipBoundTypes = false)
-        : GenericTypeVisitor{DenseHashSet<void*>{nullptr}, skipBoundTypes}
+    explicit TypeOnceVisitor(const std::string visitorName, bool skipBoundTypes)
+        : GenericTypeVisitor{visitorName, DenseHashSet<void*>{nullptr}, skipBoundTypes}
     {
     }
 };

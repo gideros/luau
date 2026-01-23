@@ -212,11 +212,10 @@ bool initHeaderFunctions(BaseCodeGenContext& codeGenContext)
             codeStart
         ))
     {
-        CODEGEN_ASSERT(!"Failed to create entry function");
         return false;
     }
 
-    // Set the offset at the begining so that functions in new blocks will not overlay the locations
+    // Set the offset at the beginning so that functions in new blocks will not overlay the locations
     // specified by the unwind information of the entry function
     unwind.setBeginOffset(build.getLabelOffset(entryLocations.prologueEnd));
 

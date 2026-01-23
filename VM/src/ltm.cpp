@@ -16,7 +16,6 @@ const char* const luaT_typenames[] = {
     "nil",
     "boolean",
 
-    
     "userdata",
     "number",
     "vector",
@@ -24,7 +23,6 @@ const char* const luaT_typenames[] = {
 
     "string",
 
-    
     "table",
     "function",
     "userdata",
@@ -34,7 +32,6 @@ const char* const luaT_typenames[] = {
 
 const char* const luaT_eventname[] = {
     // ORDER TM
-    
     "__index",
     "__newindex",
     "__mode",
@@ -45,7 +42,6 @@ const char* const luaT_eventname[] = {
 
     "__eq",
 
-    
     "__add",
     "__sub",
     "__mul",
@@ -55,7 +51,6 @@ const char* const luaT_eventname[] = {
     "__pow",
     "__unm",
 
-    
     "__lt",
     "__le",
     "__concat",
@@ -96,7 +91,7 @@ void luaT_init(lua_State* L)
 ** function to be used with macro "fasttm": optimized for absence of
 ** tag methods.
 */
-const TValue* luaT_gettm(Table* events, TMS event, TString* ename)
+const TValue* luaT_gettm(LuaTable* events, TMS event, TString* ename)
 {
     const TValue* tm = luaH_getstr(events, ename);
     LUAU_ASSERT(event <= TM_EQ);
@@ -115,7 +110,7 @@ const TValue* luaT_gettmbyobj(lua_State* L, const TValue* o, TMS event)
       NB: Tag-methods were replaced by meta-methods in Lua 5.0, but the
       old names are still around (this function, for example).
     */
-    Table* mt;
+    LuaTable* mt;
     switch (ttype(o))
     {
     case LUA_TTABLE:
@@ -157,7 +152,7 @@ const TString* luaT_objtypenamestr(lua_State* L, const TValue* o)
     }
 
     // For all types except userdata and table, a global metatable can be set with a global name override
-    if (Table* mt = L->global->mt[ttype(o)])
+    if (LuaTable* mt = L->global->mt[ttype(o)])
     {
         const TValue* type = luaH_getstr(mt, L->global->tmname[TM_TYPE]);
 

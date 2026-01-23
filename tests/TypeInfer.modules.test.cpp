@@ -8,11 +8,15 @@
 
 #include "Fixture.h"
 
+#include "Luau/VisitType.h"
 #include "doctest.h"
 
 LUAU_FASTFLAG(LuauInstantiateInSubtyping)
 LUAU_FASTFLAG(LuauSolverV2)
-LUAU_FASTFLAG(LuauTypestateBuiltins)
+LUAU_FASTFLAG(DebugLuauMagicTypes)
+LUAU_FASTINT(LuauSolverConstraintLimit)
+LUAU_FASTFLAG(LuauBetterTypeMismatchErrors)
+LUAU_FASTFLAG(LuauReworkInfiniteTypeFinder)
 
 using namespace Luau;
 
@@ -34,13 +38,13 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "dcr_require_basic")
         local b = A.a
     )";
 
-    CheckResult aResult = frontend.check("game/A");
+    CheckResult aResult = getFrontend().check("game/A");
     LUAU_REQUIRE_NO_ERRORS(aResult);
 
-    CheckResult bResult = frontend.check("game/B");
+    CheckResult bResult = getFrontend().check("game/B");
     LUAU_REQUIRE_NO_ERRORS(bResult);
 
-    ModulePtr b = frontend.moduleResolver.getModule("game/B");
+    ModulePtr b = getFrontend().moduleResolver.getModule("game/B");
     REQUIRE(b != nullptr);
     std::optional<TypeId> bType = requireType(b, "b");
     REQUIRE(bType);
@@ -76,15 +80,15 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "require")
         )";
     }
 
-    CheckResult aResult = frontend.check("game/A");
+    CheckResult aResult = getFrontend().check("game/A");
     dumpErrors(aResult);
     LUAU_REQUIRE_NO_ERRORS(aResult);
 
-    CheckResult bResult = frontend.check("game/B");
+    CheckResult bResult = getFrontend().check("game/B");
     dumpErrors(bResult);
     LUAU_REQUIRE_NO_ERRORS(bResult);
 
-    ModulePtr b = frontend.moduleResolver.getModule("game/B");
+    ModulePtr b = getFrontend().moduleResolver.getModule("game/B");
 
     REQUIRE(b != nullptr);
 
@@ -111,10 +115,10 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "require_types")
         local h: Hooty.Point
     )";
 
-    CheckResult bResult = frontend.check("workspace/B");
+    CheckResult bResult = getFrontend().check("workspace/B");
     LUAU_REQUIRE_NO_ERRORS(bResult);
 
-    ModulePtr b = frontend.moduleResolver.getModule("workspace/B");
+    ModulePtr b = getFrontend().moduleResolver.getModule("workspace/B");
     REQUIRE(b != nullptr);
 
     TypeId hType = requireType(b, "h");
@@ -134,9 +138,9 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "require_a_variadic_function")
         local f = A.f
     )";
 
-    CheckResult result = frontend.check("game/B");
+    CheckResult result = getFrontend().check("game/B");
 
-    ModulePtr bModule = frontend.moduleResolver.getModule("game/B");
+    ModulePtr bModule = getFrontend().moduleResolver.getModule("game/B");
     REQUIRE(bModule != nullptr);
 
     TypeId f = follow(requireType(bModule, "f"));
@@ -167,29 +171,24 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "cross_module_table_freeze")
         return table.freeze(require(game.A))
     )";
 
-    CheckResult aResult = frontend.check("game/A");
+    CheckResult aResult = getFrontend().check("game/A");
     LUAU_REQUIRE_NO_ERRORS(aResult);
 
-    CheckResult bResult = frontend.check("game/B");
+    CheckResult bResult = getFrontend().check("game/B");
     LUAU_REQUIRE_NO_ERRORS(bResult);
 
-    ModulePtr a = frontend.moduleResolver.getModule("game/A");
+    ModulePtr a = getFrontend().moduleResolver.getModule("game/A");
     REQUIRE(a != nullptr);
     // confirm that no cross-module mutation happened here!
-    if (FFlag::LuauSolverV2)
-        CHECK(toString(a->returnType) == "{ a: number }");
-    else
-        CHECK(toString(a->returnType) == "{| a: number |}");
+    CHECK(toString(a->returnType) == "{ a: number }");
 
-    ModulePtr b = frontend.moduleResolver.getModule("game/B");
+    ModulePtr b = getFrontend().moduleResolver.getModule("game/B");
     REQUIRE(b != nullptr);
     // confirm that no cross-module mutation happened here!
-    if (FFlag::LuauSolverV2 && FFlag::LuauTypestateBuiltins)
+    if (FFlag::LuauSolverV2)
         CHECK(toString(b->returnType) == "{ read a: number }");
-    else if (FFlag::LuauSolverV2)
-        CHECK(toString(b->returnType) == "{ a: number }");
     else
-        CHECK(toString(b->returnType) == "{| a: number |}");
+        CHECK(toString(b->returnType) == "{ a: number }");
 }
 
 TEST_CASE_FIXTURE(Fixture, "type_error_of_unknown_qualified_type")
@@ -215,11 +214,11 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "require_module_that_does_not_export")
     fileResolver.source["game/Workspace/A"] = sourceA;
     fileResolver.source["game/Workspace/B"] = sourceB;
 
-    frontend.check("game/Workspace/A");
-    frontend.check("game/Workspace/B");
+    getFrontend().check("game/Workspace/A");
+    getFrontend().check("game/Workspace/B");
 
-    ModulePtr aModule = frontend.moduleResolver.getModule("game/Workspace/A");
-    ModulePtr bModule = frontend.moduleResolver.getModule("game/Workspace/B");
+    ModulePtr aModule = getFrontend().moduleResolver.getModule("game/Workspace/A");
+    ModulePtr bModule = getFrontend().moduleResolver.getModule("game/Workspace/B");
 
     CHECK(aModule->errors.empty());
     REQUIRE_EQ(1, bModule->errors.size());
@@ -233,13 +232,13 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "require_module_that_does_not_export")
 TEST_CASE_FIXTURE(BuiltinsFixture, "warn_if_you_try_to_require_a_non_modulescript")
 {
     fileResolver.source["Modules/A"] = "";
-    fileResolver.sourceTypes["Modules/A"] = SourceCode::Local;
+    fileResolver.sourceTypes["Modules/A"] = SourceCode::Script;
 
     fileResolver.source["Modules/B"] = R"(
         local M = require(script.Parent.A)
     )";
 
-    CheckResult result = frontend.check("Modules/B");
+    CheckResult result = getFrontend().check("Modules/B");
 
     LUAU_REQUIRE_ERROR_COUNT(1, result);
 
@@ -260,9 +259,12 @@ local a : string = ""
 a = tbl.abc.def
     )";
 
-    CheckResult result = frontend.check("game/B");
+    CheckResult result = getFrontend().check("game/B");
     LUAU_REQUIRE_ERROR_COUNT(1, result);
-    CHECK_EQ("Type 'number' could not be converted into 'string'", toString(result.errors[0]));
+    if (FFlag::LuauBetterTypeMismatchErrors)
+        CHECK_EQ("Expected this to be 'string', but got 'number'", toString(result.errors[0]));
+    else
+        CHECK_EQ("Type 'number' could not be converted into 'string'", toString(result.errors[0]));
 }
 
 TEST_CASE_FIXTURE(BuiltinsFixture, "general_require_type_mismatch")
@@ -275,12 +277,12 @@ return { def = 4 }
 local tbl: string = require(game.A)
     )";
 
-    CheckResult result = frontend.check("game/B");
+    CheckResult result = getFrontend().check("game/B");
     LUAU_REQUIRE_ERROR_COUNT(1, result);
-    if (FFlag::LuauSolverV2)
-        CHECK_EQ("Type '{ def: number }' could not be converted into 'string'", toString(result.errors[0]));
+    if (FFlag::LuauBetterTypeMismatchErrors)
+        CHECK_EQ("Expected this to be 'string', but got '{ def: number }'", toString(result.errors[0]));
     else
-        CHECK_EQ("Type '{| def: number |}' could not be converted into 'string'", toString(result.errors[0]));
+        CHECK_EQ("Type '{ def: number }' could not be converted into 'string'", toString(result.errors[0]));
 }
 
 TEST_CASE_FIXTURE(Fixture, "bound_free_table_export_is_ok")
@@ -323,7 +325,7 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "require_failed_module")
 return unfortunately()
     )";
 
-    CheckResult aResult = frontend.check("game/A");
+    CheckResult aResult = getFrontend().check("game/A");
     LUAU_REQUIRE_ERRORS(aResult);
 
     CheckResult result = check(R"(
@@ -350,7 +352,7 @@ local x: Type = {}
 function x:Destroy(): () end
     )";
 
-    CheckResult result = frontend.check("game/B");
+    CheckResult result = getFrontend().check("game/B");
     LUAU_REQUIRE_ERROR_COUNT(2, result);
 }
 
@@ -368,7 +370,7 @@ local x: Type = { x = { a = 2 } }
 type Rename = typeof(x.x)
     )";
 
-    CheckResult result = frontend.check("game/B");
+    CheckResult result = getFrontend().check("game/B");
     LUAU_REQUIRE_NO_ERRORS(result);
 }
 
@@ -387,7 +389,7 @@ local x: Type = types
 type Rename = typeof(x.x)
     )";
 
-    CheckResult result = frontend.check("game/B");
+    CheckResult result = getFrontend().check("game/B");
     LUAU_REQUIRE_NO_ERRORS(result);
 }
 
@@ -461,11 +463,29 @@ local a: A.T = { x = 2 }
 local b: B.T = a
     )";
 
-    CheckResult result = frontend.check("game/C");
+    CheckResult result = getFrontend().check("game/C");
     LUAU_REQUIRE_ERROR_COUNT(1, result);
 
     if (FFlag::LuauSolverV2)
-        CHECK(toString(result.errors.at(0)) == "Type 'T' could not be converted into 'T'; at [read \"x\"], number is not exactly string");
+    {
+        const std::string expected =
+            FFlag::LuauBetterTypeMismatchErrors
+                ? "Expected this to be 'T' from 'game/B', but got 'T' from 'game/A'; \n"
+                  "accessing `x` results in `number` in the latter type and `string` in the former type, and "
+                  "`number` is not exactly `string`"
+                : "Type 'T' from 'game/A' could not be converted into 'T' from 'game/B'; \n"
+                  "this is because accessing `x` results in `number` in the former type and `string` in the latter type, and "
+                  "`number` is not exactly `string`";
+        CHECK(expected == toString(result.errors[0]));
+    }
+    else if (FFlag::LuauBetterTypeMismatchErrors)
+    {
+        const std::string expected = R"(Expected this to be exactly 'T' from 'game/B', but got 'T' from 'game/A'
+caused by:
+  Property 'x' is not compatible.
+Expected this to be exactly 'string', but got 'number')";
+        CHECK_EQ(expected, toString(result.errors[0]));
+    }
     else
     {
         const std::string expected = R"(Type 'T' from 'game/A' could not be converted into 'T' from 'game/B'
@@ -502,11 +522,29 @@ local a: A.T = { x = 2 }
 local b: B.T = a
     )";
 
-    CheckResult result = frontend.check("game/D");
+    CheckResult result = getFrontend().check("game/D");
     LUAU_REQUIRE_ERROR_COUNT(1, result);
 
     if (FFlag::LuauSolverV2)
-        CHECK(toString(result.errors.at(0)) == "Type 'T' could not be converted into 'T'; at [read \"x\"], number is not exactly string");
+    {
+        const std::string expected =
+            FFlag::LuauBetterTypeMismatchErrors
+                ? "Expected this to be 'T' from 'game/C', but got 'T' from 'game/B'; \n"
+                  "accessing `x` results in `number` in the latter type and `string` in the former type, and "
+                  "`number` is not exactly `string`"
+                : "Type 'T' from 'game/B' could not be converted into 'T' from 'game/C'; \n"
+                  "this is because accessing `x` results in `number` in the former type and `string` in the latter type, and "
+                  "`number` is not exactly `string`";
+        CHECK(expected == toString(result.errors[0]));
+    }
+    else if (FFlag::LuauBetterTypeMismatchErrors)
+    {
+        const std::string expected = R"(Expected this to be exactly 'T' from 'game/C', but got 'T' from 'game/B'
+caused by:
+  Property 'x' is not compatible.
+Expected this to be exactly 'string', but got 'number')";
+        CHECK_EQ(expected, toString(result.errors[0]));
+    }
     else
     {
         const std::string expected = R"(Type 'T' from 'game/B' could not be converted into 'T' from 'game/C'
@@ -528,7 +566,7 @@ local l0 = require(game.A)
 return l0
     )";
 
-    CheckResult result = frontend.check("game/B");
+    CheckResult result = getFrontend().check("game/B");
     LUAU_REQUIRE_NO_ERRORS(result);
 }
 
@@ -573,7 +611,7 @@ return l0
 TEST_CASE_FIXTURE(BuiltinsFixture, "ensure_scope_is_nullptr_after_shallow_copy")
 {
     ScopedFastFlag _{FFlag::LuauSolverV2, true};
-    frontend.options.retainFullTypeGraphs = false;
+    getFrontend().options.retainFullTypeGraphs = false;
 
     fileResolver.source["game/A"] = R"(
 -- Roughly taken from ReactTypes.lua
@@ -604,7 +642,7 @@ function createUpdater(renderer)
     function updater.enqueueForceUpdate(publicInstance, callback, _callerName)
         updater._renderer.render(
             updater._renderer,
-            updater._renderer._element, 
+            updater._renderer._element,
             updater._renderer._context
         )
     end
@@ -617,7 +655,7 @@ function createUpdater(renderer)
     )
         updater._renderer.render(
             updater._renderer,
-            updater._renderer._element, 
+            updater._renderer._element,
             updater._renderer._context
         )
     end
@@ -626,7 +664,7 @@ function createUpdater(renderer)
         local currentState = updater._renderer._newState or publicInstance.state
         updater._renderer.render(
             updater._renderer,
-            updater._renderer._element, 
+            updater._renderer._element,
             updater._renderer._context
         )
     end
@@ -731,9 +769,225 @@ TEST_CASE_FIXTURE(BuiltinsFixture, "spooky_blocked_type_laundered_by_bound_type"
         return Cache
     )";
 
-    LUAU_REQUIRE_NO_ERRORS(check(R"(
+    auto result = check(R"(
         local _ = require(game.A);
-    )"));
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "leaky_generics")
+{
+    ScopedFastFlag _{FFlag::LuauSolverV2, true};
+
+    auto result = check(R"(
+        local Cache = {}
+
+        Cache.settings = {}
+
+        function Cache.should_cache(url)
+            for key, _ in pairs(Cache.settings) do
+                return key
+            end
+
+            return ""
+        end
+
+        function Cache.is_cached(url)
+            local setting_key = Cache.should_cache(url)
+            local settings = Cache.settings[setting_key]
+
+            return settings
+        end
+
+        return Cache
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
+
+    CHECK("(unknown) -> unknown" == toString(requireTypeAtPosition({13, 23})));
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "cycles_dont_make_everything_any")
+{
+    fileResolver.source["game/A"] = R"(
+        --!strict
+        local module = {}
+
+        function module.foo()
+            return 2
+        end
+
+        function module.bar()
+            local m = require(game.B)
+            return m.foo() + 1
+        end
+
+        return module
+    )";
+
+    fileResolver.source["game/B"] = R"(
+        --!strict
+        local module = {}
+
+        function module.foo()
+            return 2
+        end
+
+        function module.bar()
+            local m = require(game.A)
+            return m.foo() + 1
+        end
+
+        return module
+    )";
+
+    getFrontend().check("game/A");
+
+    CHECK("module" == toString(getFrontend().moduleResolver.getModule("game/B")->returnType));
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "cross_module_function_mutation")
+{
+    ScopedFastFlag _{FFlag::LuauSolverV2, true};
+
+    fileResolver.source["game/A"] = R"(
+function test2(a: number, b: string)
+    return 1
+end
+
+return test2
+    )";
+
+    fileResolver.source["game/B"] = R"(
+function wrapper<A...>(f: (A...) -> number, ...: A...)
+end
+
+local test2 = require(game.A)
+
+return wrapper(test2, 1, "")
+    )";
+
+    CheckResult result = getFrontend().check("game/B");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "internal_types_are_scrubbed_from_module")
+{
+    ScopedFastFlag sffs[] = {
+        {FFlag::LuauSolverV2, true},
+        {FFlag::DebugLuauMagicTypes, true},
+    };
+
+    fileResolver.source["game/A"] = R"(
+return function(): _luau_blocked_type return nil :: any end
+    )";
+
+    CheckResult result = getFrontend().check("game/A");
+    LUAU_REQUIRE_ERROR_COUNT(2, result);
+    CHECK(get<ConstraintSolvingIncompleteError>(result.errors[0]));
+    CHECK(get<InternalError>(result.errors[1]));
+    CHECK("(...any) -> *error-type*" == toString(getFrontend().moduleResolver.getModule("game/A")->returnType));
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "internal_type_errors_are_only_reported_once")
+{
+    ScopedFastFlag sffs[] = {
+        {FFlag::LuauSolverV2, true},
+        {FFlag::DebugLuauMagicTypes, true},
+    };
+
+    fileResolver.source["game/A"] = R"(
+return function(): { X: _luau_blocked_type, Y: _luau_blocked_type } return nil :: any end
+    )";
+
+    CheckResult result = getFrontend().check("game/A");
+    LUAU_REQUIRE_ERROR_COUNT(2, result);
+    CHECK(get<ConstraintSolvingIncompleteError>(result.errors[0]));
+    CHECK(get<InternalError>(result.errors[1]));
+    CHECK("(...any) -> { X: *error-type*, Y: *error-type* }" == toString(getFrontend().moduleResolver.getModule("game/A")->returnType));
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "scrub_unsealed_tables")
+{
+    ScopedFastFlag sff{FFlag::LuauSolverV2, true};
+
+    ScopedFastInt sfi{FInt::LuauSolverConstraintLimit, 5};
+
+    fileResolver.source["game/A"] = R"(
+        type Array<T> = {T}
+        type Hello = Array<Array<Array<Array<Array<Array<Array<Array<Array<Array<number>>>>>>>>>>
+        local X = {}
+        X.foo = 42
+        X.bar = ""
+        return X
+    )";
+
+    fileResolver.source["game/B"] = R"(
+        local x = require(game.A)
+        x.lmao = 42
+        return {}
+    )";
+
+    CheckResult result = getFrontend().check("game/B");
+    // This is going to have a _ton_ of errors
+    LUAU_REQUIRE_ERRORS(result);
+    LUAU_CHECK_ERROR(result, CodeTooComplex);
+    LUAU_CHECK_ERROR(result, ConstraintSolvingIncompleteError);
+    LUAU_CHECK_ERROR(result, InternalError);
+    LUAU_CHECK_ERROR(result, CannotExtendTable);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "invalid_local_alias_shouldnt_shadow_imported_type")
+{
+    fileResolver.source["game/A"] = R"(
+        export type bad<T> = {T}
+        return {}
+    )";
+
+    fileResolver.source["game/B"] = R"(
+        local a_mod = require(game.A)
+        type bad<T> = {bad<{T}>}
+        type fine<T> = a_mod.bad<T>
+        local f: fine<number>
+    )";
+
+    CheckResult result = getFrontend().check("game/B");
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    CHECK(get<RecursiveRestraintViolation>(result.errors[0]));
+
+    ModulePtr b = getFrontend().moduleResolver.getModule("game/B");
+    REQUIRE(b != nullptr);
+    std::optional<TypeId> fType = requireType(b, "f");
+    REQUIRE(fType);
+    // The important thing here is that it isn't *error-type*, since that would mean that the local definition of `bad` is shadowing the imported one
+    CHECK(toString(*fType) == "fine<number>");
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "invalid_alias_should_export_as_error_type")
+{
+    ScopedFastFlag _{FFlag::LuauReworkInfiniteTypeFinder, true};
+
+    fileResolver.source["game/A"] = R"(
+        export type bad<T> = {bad<{T}>}
+        return {}
+    )";
+
+    fileResolver.source["game/B"] = R"(
+        local a_mod = require(game.A)
+        local f: a_mod.bad<number>
+    )";
+
+    CheckResult result = getFrontend().check("game/B");
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    CHECK(get<RecursiveRestraintViolation>(result.errors[0]));
+
+    ModulePtr b = getFrontend().moduleResolver.getModule("game/B");
+    REQUIRE(b != nullptr);
+    std::optional<TypeId> fType = requireType(b, "f");
+    REQUIRE(fType);
+    CHECK(toString(*fType) == "bad<number>");
 }
 
 TEST_SUITE_END();

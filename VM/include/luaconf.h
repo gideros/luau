@@ -139,6 +139,11 @@
 #define LUA_MEMORY_CATEGORIES 256
 #endif
 
+// extra storage for execution callbacks in global state
+#ifndef LUA_EXECUTION_CALLBACK_STORAGE
+#define LUA_EXECUTION_CALLBACK_STORAGE 512
+#endif
+
 // minimum size for the string table (must be power of 2)
 #ifndef LUA_MINSTRTABSIZE
 #define LUA_MINSTRTABSIZE 32
@@ -151,21 +156,8 @@
 
 // }==================================================================
 
-/*
-@@ LUAI_USER_ALIGNMENT_T is a type that requires maximum alignment.
-** CHANGE it if your system requires alignments larger than double. (For
-** instance, if your system supports long doubles and they must be
-** aligned in 16-byte boundaries, then you should add long double in the
-** union.) Probably you do not need to change this.
-*/
-#define LUAI_USER_ALIGNMENT_T \
-    union \
-    { \
-        double u; \
-        void* s; \
-        long l; \
-    }
-
-#define LUA_VECTOR_SIZE 3	/* must be 3 or 4 */
+#ifndef LUA_VECTOR_SIZE
+#define LUA_VECTOR_SIZE 3 // must be 3 or 4
+#endif
 
 #define LUA_EXTRA_SIZE (LUA_VECTOR_SIZE - 2)

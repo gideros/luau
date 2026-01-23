@@ -3,7 +3,6 @@
 
 #include "Luau/Bytecode.h"
 #include "Luau/BytecodeAnalysis.h"
-#include "Luau/BytecodeUtils.h"
 #include "Luau/IrData.h"
 #include "Luau/IrUtils.h"
 
@@ -12,6 +11,10 @@
 #include "lapi.h"
 
 #include <string.h>
+
+LUAU_FASTFLAG(LuauCodegenBlockSafeEnv)
+LUAU_FASTFLAG(LuauCodegenSetBlockEntryState2)
+LUAU_FASTFLAG(LuauCodegenChainLink)
 
 namespace Luau
 {
@@ -37,10 +40,13 @@ static bool hasTypedParameters(const BytecodeTypeInfo& typeInfo)
     return false;
 }
 
-static void buildArgumentTypeChecks(IrBuilder& build)
+static void buildArgumentTypeChecks(IrBuilder& build, IrOp entry)
 {
-    const BytecodeTypeInfo& typeInfo = build.function.bcTypeInfo;
+    const BytecodeTypeInfo& typeInfo = FFlag::LuauCodegenSetBlockEntryState2 ? build.function.bcOriginalTypeInfo : build.function.bcTypeInfo;
     CODEGEN_ASSERT(hasTypedParameters(typeInfo));
+
+    if (FFlag::LuauCodegenSetBlockEntryState2)
+        build.function.blockOp(entry).flags |= kBlockFlagEntryArgCheck;
 
     for (size_t i = 0; i < typeInfo.argumentTypes.size(); i++)
     {
@@ -63,6 +69,9 @@ static void buildArgumentTypeChecks(IrBuilder& build)
             build.inst(IrCmd::JUMP_EQ_TAG, load, build.constTag(LUA_TNIL), nextCheck, fallbackCheck);
 
             build.beginBlock(fallbackCheck);
+
+            if (FFlag::LuauCodegenSetBlockEntryState2)
+                build.function.blockOp(fallbackCheck).flags |= kBlockFlagEntryArgCheck;
         }
 
         switch (tag)
@@ -112,7 +121,11 @@ static void buildArgumentTypeChecks(IrBuilder& build)
         if (optional)
         {
             build.inst(IrCmd::JUMP, nextCheck);
+
             build.beginBlock(nextCheck);
+
+            if (FFlag::LuauCodegenSetBlockEntryState2)
+                build.function.blockOp(nextCheck).flags |= kBlockFlagEntryArgCheck;
         }
     }
 
@@ -149,7 +162,7 @@ void IrBuilder::buildFunctionIr(Proto* proto)
     {
         beginBlock(entry);
 
-        buildArgumentTypeChecks(*this);
+        buildArgumentTypeChecks(*this, entry);
 
         inst(IrCmd::JUMP, blockAtInst(0));
     }
@@ -173,11 +186,24 @@ void IrBuilder::buildFunctionIr(Proto* proto)
 
         // Begin new block at this instruction if it was in the bytecode or requested during translation
         if (instIndexToBlock[i] != kNoAssociatedBlockIndex)
-            beginBlock(blockAtInst(i));
+        {
+            if (FFlag::LuauCodegenBlockSafeEnv)
+            {
+                IrOp block = blockAtInst(i);
+
+                beginBlock(block);
+
+                function.blockOp(block).startpc = uint32_t(i);
+            }
+            else
+            {
+                beginBlock(blockAtInst(i));
+            }
+        }
 
         // Numeric for loops require additional processing to maintain loop stack
         // Notably, this must be performed even when the block is dead so that we maintain the pairing FORNPREP-FORNLOOP
-        if (op == LOP_FORNPREP)
+        if (int(op) == LOP_FORNPREP)
             beforeInstForNPrep(*this, pc, i);
 
         // We skip dead bytecode instructions when they appear after block was already terminated
@@ -199,7 +225,7 @@ void IrBuilder::buildFunctionIr(Proto* proto)
         }
 
         // See above for FORNPREP..FORNLOOP processing
-        if (op == LOP_FORNLOOP)
+        if (int(op) == LOP_FORNLOOP)
             afterInstForNLoop(*this, pc);
 
         i = nexti;
@@ -253,9 +279,34 @@ void IrBuilder::rebuildBytecodeBasicBlocks(Proto* proto)
     buildBytecodeBlocks(function, jumpTargets);
 }
 
+static bool isDirectCompare(Proto* proto, const Instruction* pc, int i)
+{
+    // Matching the compiler sequence for generating 0 or 1 based on a comparison between values:
+    // LOP_JUMP** Lx
+    // [aux]
+    // LOADB Rx, 0 +1
+    // Lx: LOADB Rx, 1
+    if (i + 3 < proto->sizecode && LUAU_INSN_D(*pc) == 2)
+    {
+        const Instruction loadTrue = pc[2];
+        const Instruction loadFalse = pc[3];
+
+        if (LUAU_INSN_OP(loadTrue) == LOP_LOADB && LUAU_INSN_OP(loadFalse) == LOP_LOADB)
+        {
+            bool sameTarget = LUAU_INSN_A(loadTrue) == LUAU_INSN_A(loadFalse);
+            bool zeroAndOne = LUAU_INSN_B(loadTrue) == 0 && LUAU_INSN_B(loadFalse) == 1;
+            bool correctJumps = LUAU_INSN_C(loadTrue) == 1 && LUAU_INSN_C(loadFalse) == 0;
+
+            return sameTarget && zeroAndOne && correctJumps;
+        }
+    }
+
+    return false;
+}
+
 void IrBuilder::translateInst(LuauOpcode op, const Instruction* pc, int i)
 {
-    switch (op)
+    switch (int(op))
     {
     case LOP_NOP:
         break;
@@ -355,15 +406,55 @@ void IrBuilder::translateInst(LuauOpcode op, const Instruction* pc, int i)
         translateInstJumpX(*this, pc, i);
         break;
     case LOP_JUMPXEQKNIL:
+        if (isDirectCompare(function.proto, pc, i))
+        {
+            translateInstJumpxEqNilShortcut(*this, pc, i);
+
+            // We complete the current instruction and the first LOADB, but we do not skip the second LOADB
+            // This is because the second LOADB was a jump target so there is a block prepared to handle it
+            cmdSkipTarget = i + 3;
+            break;
+        }
+
         translateInstJumpxEqNil(*this, pc, i);
         break;
     case LOP_JUMPXEQKB:
+        if (isDirectCompare(function.proto, pc, i))
+        {
+            translateInstJumpxEqBShortcut(*this, pc, i);
+
+            // We complete the current instruction and the first LOADB, but we do not skip the second LOADB
+            // This is because the second LOADB was a jump target so there is a block prepared to handle it
+            cmdSkipTarget = i + 3;
+            break;
+        }
+
         translateInstJumpxEqB(*this, pc, i);
         break;
     case LOP_JUMPXEQKN:
+        if (isDirectCompare(function.proto, pc, i))
+        {
+            translateInstJumpxEqNShortcut(*this, pc, i);
+
+            // We complete the current instruction and the first LOADB, but we do not skip the second LOADB
+            // This is because the second LOADB was a jump target so there is a block prepared to handle it
+            cmdSkipTarget = i + 3;
+            break;
+        }
+
         translateInstJumpxEqN(*this, pc, i);
         break;
     case LOP_JUMPXEQKS:
+        if (isDirectCompare(function.proto, pc, i))
+        {
+            translateInstJumpxEqSShortcut(*this, pc, i);
+
+            // We complete the current instruction and the first LOADB, but we do not skip the second LOADB
+            // This is because the second LOADB was a jump target so there is a block prepared to handle it
+            cmdSkipTarget = i + 3;
+            break;
+        }
+
         translateInstJumpxEqS(*this, pc, i);
         break;
     case LOP_ADD:
@@ -525,7 +616,7 @@ void IrBuilder::translateInst(LuauOpcode op, const Instruction* pc, int i)
             int ra = LUAU_INSN_A(*pc);
 
             IrOp loopRepeat = blockAtInst(i + 1 + LUAU_INSN_D(*pc));
-            IrOp loopExit = blockAtInst(i + getOpLength(LOP_FORGLOOP));
+            IrOp loopExit = blockAtInst(i + getOpLength(LuauOpcode(LOP_FORGLOOP)));
             IrOp fallback = block(IrBlockKind::Fallback);
 
             inst(IrCmd::INTERRUPT, constUint(i));
@@ -643,8 +734,92 @@ void IrBuilder::loadAndCheckTag(IrOp loc, uint8_t tag, IrOp fallback)
     inst(IrCmd::CHECK_TAG, inst(IrCmd::LOAD_TAG, loc), constTag(tag), fallback);
 }
 
-void IrBuilder::clone(const IrBlock& source, bool removeCurrentTerminator)
+void IrBuilder::checkSafeEnv(int pcpos)
 {
+    IrBlock& active = function.blocks[activeBlockIdx];
+
+    // If the block start is associated with a bytecode position, we can perform an early safeenv check
+    if (active.startpc != kBlockNoStartPc)
+    {
+        // If the block hasn't cleared the safeenv flag yet, we can still set it at block entry
+        if ((active.flags & kBlockFlagSafeEnvClear) == 0)
+            active.flags |= kBlockFlagSafeEnvCheck;
+    }
+
+    inst(IrCmd::CHECK_SAFE_ENV, vmExit(pcpos));
+}
+
+void IrBuilder::clone_NEW(std::vector<uint32_t> sourceIdxs, bool removeCurrentTerminator)
+{
+    CODEGEN_ASSERT(FFlag::LuauCodegenChainLink);
+
+    DenseHashMap<uint32_t, uint32_t> instRedir{~0u};
+
+    auto redirect = [&instRedir](IrOp& op)
+    {
+        if (op.kind == IrOpKind::Inst)
+        {
+            if (const uint32_t* newIndex = instRedir.find(op.index))
+                op.index = *newIndex;
+            else
+                CODEGEN_ASSERT(!"Values can only be used if they are defined in the same block");
+        }
+    };
+
+    for (uint32_t sourceIdx : sourceIdxs)
+    {
+        const IrBlock& source = function.blocks[sourceIdx];
+
+        if (removeCurrentTerminator && inTerminatedBlock)
+        {
+            IrBlock& active = function.blocks[activeBlockIdx];
+            IrInst& term = function.instructions[active.finish];
+
+            kill(function, term);
+            inTerminatedBlock = false;
+        }
+
+        for (uint32_t index = source.start; index <= source.finish; index++)
+        {
+            CODEGEN_ASSERT(index < function.instructions.size());
+            IrInst clone = function.instructions[index];
+
+            // Skip pseudo instructions to make clone more compact, but validate that they have no users
+            if (isPseudo(clone.cmd))
+            {
+                CODEGEN_ASSERT(clone.useCount == 0);
+                continue;
+            }
+
+            redirect(clone.a);
+            redirect(clone.b);
+            redirect(clone.c);
+            redirect(clone.d);
+            redirect(clone.e);
+            redirect(clone.f);
+            redirect(clone.g);
+
+            addUse(function, clone.a);
+            addUse(function, clone.b);
+            addUse(function, clone.c);
+            addUse(function, clone.d);
+            addUse(function, clone.e);
+            addUse(function, clone.f);
+            addUse(function, clone.g);
+
+            // Instructions that referenced the original will have to be adjusted to use the clone
+            instRedir[index] = uint32_t(function.instructions.size());
+
+            // Reconstruct the fresh clone
+            inst(clone.cmd, clone.a, clone.b, clone.c, clone.d, clone.e, clone.f, clone.g);
+        }
+    }
+}
+
+void IrBuilder::clone_DEPRECATED(const IrBlock& source, bool removeCurrentTerminator)
+{
+    CODEGEN_ASSERT(!FFlag::LuauCodegenChainLink);
+
     DenseHashMap<uint32_t, uint32_t> instRedir{~0u};
 
     auto redirect = [&instRedir](IrOp& op)
@@ -720,6 +895,14 @@ IrOp IrBuilder::constUint(unsigned value)
 {
     IrConst constant;
     constant.kind = IrConstKind::Uint;
+    constant.valueUint = value;
+    return constAny(constant, uint64_t(value));
+}
+
+IrOp IrBuilder::constImport(unsigned value)
+{
+    IrConst constant;
+    constant.kind = IrConstKind::Import;
     constant.valueUint = value;
     return constAny(constant, uint64_t(value));
 }
@@ -811,6 +994,12 @@ IrOp IrBuilder::inst(IrCmd cmd, IrOp a, IrOp b, IrOp c, IrOp d, IrOp e, IrOp f, 
     {
         function.blocks[activeBlockIdx].finish = index;
         inTerminatedBlock = true;
+    }
+
+    if (FFlag::LuauCodegenBlockSafeEnv && canInvalidateSafeEnv(cmd))
+    {
+        // Mark that block has instruction with this flag
+        function.blocks[activeBlockIdx].flags |= kBlockFlagSafeEnvClear;
     }
 
     return {IrOpKind::Inst, index};

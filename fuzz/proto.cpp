@@ -12,14 +12,16 @@
 #include "Luau/Linter.h"
 #include "Luau/ModuleResolver.h"
 #include "Luau/Parser.h"
+#include "Luau/PrettyPrinter.h"
 #include "Luau/ToString.h"
-#include "Luau/Transpiler.h"
 #include "Luau/TypeInfer.h"
 
 #include "lua.h"
 #include "lualib.h"
 
 #include <chrono>
+#include <string>
+#include <vector>
 #include <cstring>
 
 static bool getEnvParam(const char* name, bool def)
@@ -36,7 +38,7 @@ const bool kFuzzCompiler = getEnvParam("LUAU_FUZZ_COMPILER", true);
 const bool kFuzzLinter = getEnvParam("LUAU_FUZZ_LINTER", true);
 const bool kFuzzTypeck = getEnvParam("LUAU_FUZZ_TYPE_CHECK", true);
 const bool kFuzzVM = getEnvParam("LUAU_FUZZ_VM", true);
-const bool kFuzzTranspile = getEnvParam("LUAU_FUZZ_TRANSPILE", true);
+const bool kFuzzPrettyPrint = getEnvParam("LUAU_FUZZ_PRETTY_PRINT", true);
 const bool kFuzzCodegenVM = getEnvParam("LUAU_FUZZ_CODEGEN_VM", true);
 const bool kFuzzCodegenAssembly = getEnvParam("LUAU_FUZZ_CODEGEN_ASM", true);
 const bool kFuzzUseNewSolver = getEnvParam("LUAU_FUZZ_NEW_SOLVER", false);
@@ -57,6 +59,8 @@ LUAU_FASTINT(LuauTarjanChildLimit)
 LUAU_FASTFLAG(DebugLuauFreezeArena)
 LUAU_FASTFLAG(DebugLuauAbortingChecks)
 LUAU_FASTFLAG(LuauSolverV2)
+
+const double kTypecheckTimeoutSec = 4.0;
 
 std::chrono::milliseconds kInterruptTimeout(10);
 std::chrono::time_point<std::chrono::system_clock> interruptDeadline;
@@ -96,6 +100,11 @@ void* allocate(void* ud, void* ptr, size_t osize, size_t nsize)
     }
 }
 
+int lua_silence(lua_State* L)
+{
+    return 0;
+}
+
 lua_State* createGlobalState()
 {
     lua_State* L = lua_newstate(allocate, NULL);
@@ -106,6 +115,15 @@ lua_State* createGlobalState()
     lua_callbacks(L)->interrupt = interrupt;
 
     luaL_openlibs(L);
+
+    std::vector<luaL_Reg> funcs;
+    funcs.push_back({"print", lua_silence}); // do not let fuzz input to print to stdout
+    funcs.push_back({nullptr, nullptr});     // "null" terminate the list of functions to register
+
+    lua_pushvalue(L, LUA_GLOBALSINDEX);
+    luaL_register(L, nullptr, funcs.data());
+    lua_pop(L, 1);
+
     luaL_sandbox(L);
 
     return L;
@@ -124,8 +142,8 @@ int registerTypes(Luau::Frontend& frontend, Luau::GlobalTypes& globals, bool for
     // Vector3 stub
     TypeId vector3MetaType = arena.addType(TableType{});
 
-    TypeId vector3InstanceType = arena.addType(ClassType{"Vector3", {}, nullopt, vector3MetaType, {}, {}, "Test", {}});
-    getMutable<ClassType>(vector3InstanceType)->props = {
+    TypeId vector3InstanceType = arena.addType(ExternType{"Vector3", {}, nullopt, vector3MetaType, {}, {}, "Test", {}});
+    getMutable<ExternType>(vector3InstanceType)->props = {
         {"X", {builtinTypes.numberType}},
         {"Y", {builtinTypes.numberType}},
         {"Z", {builtinTypes.numberType}},
@@ -134,20 +152,21 @@ int registerTypes(Luau::Frontend& frontend, Luau::GlobalTypes& globals, bool for
     getMutable<TableType>(vector3MetaType)->props = {
         {"__add", {makeFunction(arena, nullopt, {vector3InstanceType, vector3InstanceType}, {vector3InstanceType})}},
     };
+    getMutable<TableType>(vector3MetaType)->state = TableState::Sealed;
 
     globals.globalScope->exportedTypeBindings["Vector3"] = TypeFun{{}, vector3InstanceType};
 
     // Instance stub
-    TypeId instanceType = arena.addType(ClassType{"Instance", {}, nullopt, nullopt, {}, {}, "Test", {}});
-    getMutable<ClassType>(instanceType)->props = {
+    TypeId instanceType = arena.addType(ExternType{"Instance", {}, nullopt, nullopt, {}, {}, "Test", {}});
+    getMutable<ExternType>(instanceType)->props = {
         {"Name", {builtinTypes.stringType}},
     };
 
     globals.globalScope->exportedTypeBindings["Instance"] = TypeFun{{}, instanceType};
 
     // Part stub
-    TypeId partType = arena.addType(ClassType{"Part", {}, instanceType, nullopt, {}, {}, "Test", {}});
-    getMutable<ClassType>(partType)->props = {
+    TypeId partType = arena.addType(ExternType{"Part", {}, instanceType, nullopt, {}, {}, "Test", {}});
+    getMutable<ExternType>(partType)->props = {
         {"Position", {vector3InstanceType}},
     };
 
@@ -174,6 +193,19 @@ static void setupFrontend(Luau::Frontend& frontend)
     };
 }
 
+static Luau::FrontendOptions getFrontendOptions()
+{
+    Luau::FrontendOptions options;
+
+    options.retainFullTypeGraphs = true;
+    options.forAutocomplete = false;
+    options.runLintChecks = kFuzzLinter;
+
+    options.moduleTimeLimitSec = kTypecheckTimeoutSec;
+
+    return options;
+}
+
 struct FuzzFileResolver : Luau::FileResolver
 {
     std::optional<Luau::SourceCode> readSource(const Luau::ModuleName& name) override
@@ -185,7 +217,7 @@ struct FuzzFileResolver : Luau::FileResolver
         return Luau::SourceCode{it->second, Luau::SourceCode::Module};
     }
 
-    std::optional<Luau::ModuleInfo> resolveModule(const Luau::ModuleInfo* context, Luau::AstExpr* expr) override
+    std::optional<Luau::ModuleInfo> resolveModule(const Luau::ModuleInfo* context, Luau::AstExpr* expr, const Luau::TypeCheckLimits& _limits) override
     {
         if (Luau::AstExprGlobal* g = expr->as<Luau::AstExprGlobal>())
             return Luau::ModuleInfo{g->name.value};
@@ -215,7 +247,7 @@ struct FuzzConfigResolver : Luau::ConfigResolver
         defaultConfig.parseOptions.captureComments = true;
     }
 
-    virtual const Luau::Config& getConfig(const Luau::ModuleName& name) const override
+    virtual const Luau::Config& getConfig(const Luau::ModuleName& name, const Luau::TypeCheckLimits& _limits) const override
     {
         return defaultConfig;
     }
@@ -242,8 +274,10 @@ DEFINE_PROTO_FUZZER(const luau::ModuleSet& message)
     FInt::LuauTableTypeMaximumStringifierLength.value = 100;
 
     for (Luau::FValue<bool>* flag = Luau::FValue<bool>::list; flag; flag = flag->next)
+    {
         if (strncmp(flag->name, "Luau", 4) == 0)
             flag->value = true;
+    }
 
     FFlag::DebugLuauFreezeArena.value = true;
     FFlag::DebugLuauAbortingChecks.value = true;
@@ -285,7 +319,7 @@ DEFINE_PROTO_FUZZER(const luau::ModuleSet& message)
     {
         static FuzzFileResolver fileResolver;
         static FuzzConfigResolver configResolver;
-        static Luau::FrontendOptions defaultOptions{/*retainFullTypeGraphs*/ true, /*forAutocomplete*/ false, /*runLintChecks*/ kFuzzLinter};
+        static Luau::FrontendOptions defaultOptions = getFrontendOptions();
         static Luau::Frontend frontend(&fileResolver, &configResolver, defaultOptions);
 
         static int once = (setupFrontend(frontend), 0);
@@ -335,12 +369,12 @@ DEFINE_PROTO_FUZZER(const luau::ModuleSet& message)
         }
     }
 
-    if (kFuzzTranspile)
+    if (kFuzzPrettyPrint)
     {
         for (Luau::ParseResult& parseResult : parseResults)
         {
             if (parseResult.root)
-                transpileWithTypes(*parseResult.root);
+                prettyPrintWithTypes(*parseResult.root);
         }
     }
 

@@ -35,12 +35,12 @@ struct Scope
     explicit Scope(TypePackId returnType);                    // root scope
     explicit Scope(const ScopePtr& parent, int subLevel = 0); // child scope.  Parent must not be nullptr.
 
-    const ScopePtr parent; // null for the root
+    ScopePtr parent; // null for the root
 
     // All the children of this scope.
     std::vector<NotNull<Scope>> children;
     std::unordered_map<Symbol, Binding> bindings;
-    TypePackId returnType;
+    TypePackId returnType = nullptr;
     std::optional<TypePackId> varargPack;
 
     TypeLevel level;
@@ -59,6 +59,8 @@ struct Scope
 
     std::optional<TypeId> lookup(Symbol sym) const;
     std::optional<TypeId> lookupUnrefinedType(DefId def) const;
+
+    std::optional<TypeId> lookupRValueRefinementType(DefId def) const;
     std::optional<TypeId> lookup(DefId def) const;
     std::optional<std::pair<TypeId, Scope*>> lookupEx(DefId def);
     std::optional<std::pair<Binding*, Scope*>> lookupEx(Symbol sym);
@@ -71,6 +73,7 @@ struct Scope
 
     // WARNING: This function linearly scans for a string key of equal value!  It is thus O(n**2)
     std::optional<Binding> linearSearchForBinding(const std::string& name, bool traverseScopeChain = true) const;
+    std::optional<std::pair<Symbol, Binding>> linearSearchForBindingPair(const std::string& name, bool traverseScopeChain) const;
 
     RefinementMap refinements;
 
@@ -85,12 +88,35 @@ struct Scope
     void inheritAssignments(const ScopePtr& childScope);
     void inheritRefinements(const ScopePtr& childScope);
 
+    // Track globals that should emit warnings during type checking.
+    DenseHashSet<std::string> globalsToWarn{""};
+    bool shouldWarnGlobal(std::string name) const;
+
     // For mutually recursive type aliases, it's important that
     // they use the same types for the same names.
     // For instance, in `type Tree<T> { data: T, children: Forest<T> } type Forest<T> = {Tree<T>}`
     // we need that the generic type `T` in both cases is the same, so we use a cache.
     std::unordered_map<Name, TypeId> typeAliasTypeParameters;
     std::unordered_map<Name, TypePackId> typeAliasTypePackParameters;
+
+    std::optional<std::vector<TypeId>> interiorFreeTypes;
+    std::optional<std::vector<TypePackId>> interiorFreeTypePacks;
+
+    // Currently, Luau has a very strict restriction on recursive uses of
+    // type aliases (see: https://github.com/luau-lang/luau/pull/68). We keep
+    // a mapping of type aliases that violate this restriction to the location
+    // that marked said trigger.
+    //
+    // CLI-183875: Surely this can be an AstName?
+    DenseHashMap<std::string, Location> invalidTypeAliases{{}};
+    std::optional<Location> isInvalidTypeAlias(const std::string& name) const;
+
+    // Clip with LuauReworkInfiniteTypeFinder
+    // A set of type alias names that are invalid because they violate the recursion restrictions of type aliases.
+    DenseHashSet<std::string> invalidTypeAliasNames_DEPRECATED{""};
+    bool isInvalidTypeAliasName_DEPRECATED(const std::string& name) const;
+
+    NotNull<Scope> findNarrowestScopeContaining(Location);
 };
 
 // Returns true iff the left scope encloses the right scope.  A Scope* equal to

@@ -9,16 +9,14 @@
 #include "Luau/Common.h"
 
 #include <algorithm>
-#include <math.h>
-#include <limits.h>
+#include <cmath>
+#include <climits>
 
 LUAU_FASTINTVARIABLE(LuauSuggestionDistance, 4)
 
 LUAU_FASTFLAG(LuauSolverV2)
 
-LUAU_FASTFLAG(LuauAttribute)
-LUAU_FASTFLAG(LuauNativeAttribute)
-LUAU_FASTFLAGVARIABLE(LintRedundantNativeAttribute, false)
+LUAU_FASTFLAG(LuauExplicitTypeInstantiationSyntax)
 
 namespace Luau
 {
@@ -106,7 +104,7 @@ static void emitWarning(LintContext& context, LintWarning::Code code, const Loca
     std::string message = vformat(format, args);
     va_end(args);
 
-    LintWarning warning = {code, location, message};
+    LintWarning warning = {code, location, std::move(message)};
     context.result.push_back(warning);
 }
 
@@ -192,6 +190,11 @@ static bool similar(AstExpr* lhs, AstExpr* rhs)
 
         return true;
     }
+    CASE(AstExprInstantiate)
+    {
+        LUAU_ASSERT(FFlag::LuauExplicitTypeInstantiationSyntax);
+        return similar(le->expr, re->expr);
+    }
     else
     {
         LUAU_ASSERT(!"Unknown expression type");
@@ -271,7 +274,9 @@ private:
             Global* g = globals.find(gv->name);
 
             if (!g || (!g->assigned && !g->builtin))
-                emitWarning(*context, LintWarning::Code_UnknownGlobal, gv->location, "Unknown global '%s'", gv->name.value);
+                emitWarning(
+                    *context, LintWarning::Code_UnknownGlobal, gv->location, "Unknown global '%s'; consider assigning to it first", gv->name.value
+                );
             else if (g->deprecated)
             {
                 if (const char* replacement = *g->deprecated; replacement && strlen(replacement))
@@ -903,6 +908,11 @@ private:
     }
 
     bool visit(AstType* node) override
+    {
+        return true;
+    }
+
+    bool visit(AstTypePack* node) override
     {
         return true;
     }
@@ -1969,6 +1979,11 @@ private:
         return true;
     }
 
+    bool visit(AstTypePack* node) override
+    {
+        return true;
+    }
+
     bool visit(AstTypeTable* node) override
     {
         if (FFlag::LuauSolverV2)
@@ -2281,6 +2296,58 @@ private:
     {
     }
 
+    bool visit(AstExprLocal* node) override
+    {
+        const FunctionType* fty = getFunctionType(node);
+        bool shouldReport = fty && fty->isDeprecatedFunction && !inScope(fty);
+
+        if (shouldReport)
+        {
+            if (fty->deprecatedInfo != nullptr)
+            {
+                report(node->location, node->local->name.value, *fty->deprecatedInfo);
+            }
+            else
+            {
+                report(node->location, node->local->name.value);
+            }
+        }
+
+        return true;
+    }
+
+    bool visit(AstExprGlobal* node) override
+    {
+        const FunctionType* fty = getFunctionType(node);
+        bool shouldReport = fty && fty->isDeprecatedFunction && !inScope(fty);
+
+        if (shouldReport)
+        {
+            if (fty->deprecatedInfo != nullptr)
+            {
+                report(node->location, node->name.value, *fty->deprecatedInfo);
+            }
+            else
+            {
+                report(node->location, node->name.value);
+            }
+        }
+
+        return true;
+    }
+
+    bool visit(AstStatLocalFunction* node) override
+    {
+        check(node->func);
+        return false;
+    }
+
+    bool visit(AstStatFunction* node) override
+    {
+        check(node->func);
+        return false;
+    }
+
     bool visit(AstExprIndexName* node) override
     {
         if (std::optional<TypeId> ty = context->getType(node->expr))
@@ -2320,24 +2387,78 @@ private:
 
     void check(AstExprIndexName* node, TypeId ty)
     {
-        if (const ClassType* cty = get<ClassType>(ty))
+        if (const ExternType* cty = get<ExternType>(ty))
         {
-            const Property* prop = lookupClassProp(cty, node->index.value);
+            if (const Property* prop = lookupExternTypeProp(cty, node->index.value))
+            {
+                if (prop->deprecated)
+                {
+                    report(node->location, *prop, cty->name.c_str(), node->index.value);
+                }
+                else if (std::optional<TypeId> ty = prop->readTy)
+                {
+                    const FunctionType* fty = get<FunctionType>(follow(ty));
+                    bool shouldReport = fty && fty->isDeprecatedFunction && !inScope(fty);
 
-            if (prop && prop->deprecated)
-                report(node->location, *prop, cty->name.c_str(), node->index.value);
+                    if (shouldReport)
+                    {
+                        const char* className = nullptr;
+                        if (AstExprGlobal* global = node->expr->as<AstExprGlobal>())
+                            className = global->name.value;
+
+                        const char* functionName = node->index.value;
+                        if (fty->deprecatedInfo != nullptr)
+                        {
+                            report(node->location, className, functionName, *fty->deprecatedInfo);
+                        }
+                        else
+                        {
+                            report(node->location, className, functionName);
+                        }
+                    }
+                }
+            }
         }
         else if (const TableType* tty = get<TableType>(ty))
         {
             auto prop = tty->props.find(node->index.value);
 
-            if (prop != tty->props.end() && prop->second.deprecated)
+            if (prop != tty->props.end())
             {
-                // strip synthetic typeof() for builtin tables
-                if (tty->name && tty->name->compare(0, 7, "typeof(") == 0 && tty->name->back() == ')')
-                    report(node->location, prop->second, tty->name->substr(7, tty->name->length() - 8).c_str(), node->index.value);
+                if (prop->second.deprecated)
+                {
+                    // strip synthetic typeof() for builtin tables
+                    if (tty->name && tty->name->compare(0, 7, "typeof(") == 0 && tty->name->back() == ')')
+                        report(node->location, prop->second, tty->name->substr(7, tty->name->length() - 8).c_str(), node->index.value);
+                    else
+                        report(node->location, prop->second, tty->name ? tty->name->c_str() : nullptr, node->index.value);
+                }
                 else
-                    report(node->location, prop->second, tty->name ? tty->name->c_str() : nullptr, node->index.value);
+                {
+                    if (std::optional<TypeId> ty = prop->second.readTy)
+                    {
+                        const FunctionType* fty = get<FunctionType>(follow(ty));
+                        bool shouldReport = fty && fty->isDeprecatedFunction && !inScope(fty);
+
+                        if (shouldReport)
+                        {
+                            const char* className = nullptr;
+                            if (AstExprGlobal* global = node->expr->as<AstExprGlobal>())
+                                className = global->name.value;
+
+                            const char* functionName = node->index.value;
+
+                            if (fty->deprecatedInfo != nullptr)
+                            {
+                                report(node->location, className, functionName, *fty->deprecatedInfo);
+                            }
+                            else
+                            {
+                                report(node->location, className, functionName);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2356,6 +2477,24 @@ private:
         }
     }
 
+    void check(AstExprFunction* func)
+    {
+        LUAU_ASSERT(func);
+
+        const FunctionType* fty = getFunctionType(func);
+        bool isDeprecated = fty && fty->isDeprecatedFunction;
+        // If a function is deprecated, we don't want to flag its recursive uses.
+        // So we push it on a stack while its body is being analyzed.
+        // When a deprecated function is used, we check the stack to ensure that we are not inside that function.
+        if (isDeprecated)
+            pushScope(fty);
+
+        func->visit(this);
+
+        if (isDeprecated)
+            popScope(fty);
+    }
+
     void report(const Location& location, const Property& prop, const char* container, const char* field)
     {
         std::string suggestion = prop.deprecatedSuggestion.empty() ? "" : format(", use '%s' instead", prop.deprecatedSuggestion.c_str());
@@ -2364,6 +2503,90 @@ private:
             emitWarning(*context, LintWarning::Code_DeprecatedApi, location, "Member '%s.%s' is deprecated%s", container, field, suggestion.c_str());
         else
             emitWarning(*context, LintWarning::Code_DeprecatedApi, location, "Member '%s' is deprecated%s", field, suggestion.c_str());
+    }
+
+    void report(const Location& location, const char* tableName, const char* functionName)
+    {
+        if (tableName)
+            emitWarning(*context, LintWarning::Code_DeprecatedApi, location, "Member '%s.%s' is deprecated", tableName, functionName);
+        else
+            emitWarning(*context, LintWarning::Code_DeprecatedApi, location, "Member '%s' is deprecated", functionName);
+    }
+
+    void report(const Location& location, const char* tableName, const char* functionName, const AstAttr::DeprecatedInfo& info)
+    {
+        std::string usePart = info.use ? format(", use '%s' instead", info.use->c_str()) : "";
+        std::string reasonPart = info.reason ? format(". %s", info.reason->c_str()) : "";
+        if (tableName)
+            emitWarning(
+                *context,
+                LintWarning::Code_DeprecatedApi,
+                location,
+                "Member '%s.%s' is deprecated%s%s",
+                tableName,
+                functionName,
+                usePart.c_str(),
+                reasonPart.c_str()
+            );
+        else
+            emitWarning(
+                *context,
+                LintWarning::Code_DeprecatedApi,
+                location,
+                "Member '%s' is deprecated%s%s",
+                functionName,
+                usePart.c_str(),
+                reasonPart.c_str()
+            );
+    }
+
+    void report(const Location& location, const char* functionName)
+    {
+        emitWarning(*context, LintWarning::Code_DeprecatedApi, location, "Function '%s' is deprecated", functionName);
+    }
+
+    void report(const Location& location, const char* functionName, const AstAttr::DeprecatedInfo& info)
+    {
+        std::string usePart = info.use ? format(", use '%s' instead", info.use->c_str()) : "";
+        std::string reasonPart = info.reason ? format(". %s", info.reason->c_str()) : "";
+        emitWarning(
+            *context, LintWarning::Code_DeprecatedApi, location, "Function '%s' is deprecated%s%s", functionName, usePart.c_str(), reasonPart.c_str()
+        );
+    }
+
+    std::vector<const FunctionType*> functionTypeScopeStack;
+
+    void pushScope(const FunctionType* fty)
+    {
+        LUAU_ASSERT(fty);
+
+        functionTypeScopeStack.push_back(fty);
+    }
+
+    void popScope(const FunctionType* fty)
+    {
+        LUAU_ASSERT(fty);
+
+        LUAU_ASSERT(fty == functionTypeScopeStack.back());
+        functionTypeScopeStack.pop_back();
+    }
+
+    bool inScope(const FunctionType* fty) const
+    {
+        LUAU_ASSERT(fty);
+
+        return std::find(functionTypeScopeStack.begin(), functionTypeScopeStack.end(), fty) != functionTypeScopeStack.end();
+    }
+
+    const FunctionType* getFunctionType(AstExpr* node)
+    {
+        std::optional<TypeId> ty = context->getType(node);
+        if (!ty)
+            return nullptr;
+
+        const FunctionType* fty = get<FunctionType>(follow(ty));
+
+        return fty;
     }
 };
 
@@ -3087,7 +3310,7 @@ static void fillBuiltinGlobals(LintContext& context, const AstNameTable& names, 
     }
 }
 
-static const char* fuzzyMatch(std::string_view str, const char** array, size_t size)
+static const char* fuzzyMatch(std::string_view str, const char* const* array, size_t size)
 {
     if (FInt::LuauSuggestionDistance == 0)
         return nullptr;
@@ -3239,9 +3462,6 @@ static void lintComments(LintContext& context, const std::vector<HotComment>& ho
 
 static bool hasNativeCommentDirective(const std::vector<HotComment>& hotcomments)
 {
-    LUAU_ASSERT(FFlag::LuauNativeAttribute);
-    LUAU_ASSERT(FFlag::LintRedundantNativeAttribute);
-
     for (const HotComment& hc : hotcomments)
     {
         if (hc.content.empty() || hc.content[0] == ' ' || hc.content[0] == '\t')
@@ -3265,9 +3485,6 @@ struct LintRedundantNativeAttribute : AstVisitor
 public:
     LUAU_NOINLINE static void process(LintContext& context)
     {
-        LUAU_ASSERT(FFlag::LuauNativeAttribute);
-        LUAU_ASSERT(FFlag::LintRedundantNativeAttribute);
-
         LintRedundantNativeAttribute pass;
         pass.context = &context;
         context.root->visit(&pass);
@@ -3389,7 +3606,7 @@ std::vector<LintWarning> lint(
     if (context.warningEnabled(LintWarning::Code_ComparisonPrecedence))
         LintComparisonPrecedence::process(context);
 
-    if (FFlag::LuauNativeAttribute && FFlag::LintRedundantNativeAttribute && context.warningEnabled(LintWarning::Code_RedundantNativeAttribute))
+    if (context.warningEnabled(LintWarning::Code_RedundantNativeAttribute))
     {
         if (hasNativeCommentDirective(hotcomments))
             LintRedundantNativeAttribute::process(context);

@@ -2,11 +2,9 @@
 #include "Luau/TypePack.h"
 
 #include "Luau/Error.h"
+#include "Luau/StructuralTypeEquality.h"
 #include "Luau/TxnLog.h"
-
-#include <stdexcept>
-
-LUAU_FASTFLAG(LuauSolverV2);
+#include "Luau/TypeArena.h"
 
 namespace Luau
 {
@@ -18,10 +16,11 @@ FreeTypePack::FreeTypePack(TypeLevel level)
 {
 }
 
-FreeTypePack::FreeTypePack(Scope* scope)
+FreeTypePack::FreeTypePack(Scope* scope, Polarity polarity)
     : index(Unifiable::freshIndex())
     , level{}
     , scope(scope)
+    , polarity(polarity)
 {
 }
 
@@ -52,9 +51,10 @@ GenericTypePack::GenericTypePack(const Name& name)
 {
 }
 
-GenericTypePack::GenericTypePack(Scope* scope)
+GenericTypePack::GenericTypePack(Scope* scope, Polarity polarity)
     : index(Unifiable::freshIndex())
     , scope(scope)
+    , polarity(polarity)
 {
 }
 
@@ -71,6 +71,22 @@ GenericTypePack::GenericTypePack(Scope* scope, const Name& name)
     , scope(scope)
     , name(name)
     , explicitName(true)
+{
+}
+
+GenericTypePack::GenericTypePack(Scope* scope, Name name, Polarity polarity)
+    : index(Unifiable::freshIndex())
+    , scope(scope)
+    , name(std::move(name))
+    , explicitName(true)
+    , polarity(polarity)
+{
+}
+
+GenericTypePack::GenericTypePack(Polarity polarity)
+    : index(Unifiable::freshIndex())
+    , name("g" + std::to_string(index))
+    , polarity(polarity)
 {
 }
 
@@ -147,6 +163,15 @@ TypePackIterator& TypePackIterator::operator++()
         currentTypePack = tp->tail ? log->follow(*tp->tail) : nullptr;
         tp = currentTypePack ? log->getMutable<TypePack>(currentTypePack) : nullptr;
 
+        if (tp)
+        {
+            // Step twice on each iteration to detect cycles
+            tailCycleCheck = tp->tail ? log->follow(*tp->tail) : nullptr;
+
+            if (currentTypePack == tailCycleCheck)
+                throw InternalCompilerError("TypePackIterator detected a type pack cycle");
+        }
+
         currentIndex = 0;
     }
 
@@ -197,62 +222,24 @@ TypePackIterator end(TypePackId tp)
     return TypePackIterator{};
 }
 
-bool areEqual(SeenSet& seen, const TypePackVar& lhs, const TypePackVar& rhs)
+TypePackId getTail(TypePackId tp)
 {
-    TypePackId lhsId = const_cast<TypePackId>(&lhs);
-    TypePackId rhsId = const_cast<TypePackId>(&rhs);
-    TypePackIterator lhsIter = begin(lhsId);
-    TypePackIterator rhsIter = begin(rhsId);
-    TypePackIterator lhsEnd = end(lhsId);
-    TypePackIterator rhsEnd = end(rhsId);
-    while (lhsIter != lhsEnd && rhsIter != rhsEnd)
+    DenseHashSet<TypePackId> seen{nullptr};
+    while (tp)
     {
-        if (!areEqual(seen, **lhsIter, **rhsIter))
-            return false;
-        ++lhsIter;
-        ++rhsIter;
+        tp = follow(tp);
+
+        if (seen.contains(tp))
+            break;
+        seen.insert(tp);
+
+        if (auto pack = get<TypePack>(tp); pack && pack->tail)
+            tp = *pack->tail;
+        else
+            break;
     }
 
-    if (lhsIter != lhsEnd || rhsIter != rhsEnd)
-        return false;
-
-    if (!lhsIter.tail() && !rhsIter.tail())
-        return true;
-    if (!lhsIter.tail() || !rhsIter.tail())
-        return false;
-
-    TypePackId lhsTail = *lhsIter.tail();
-    TypePackId rhsTail = *rhsIter.tail();
-
-    {
-        const FreeTypePack* lf = get_if<FreeTypePack>(&lhsTail->ty);
-        const FreeTypePack* rf = get_if<FreeTypePack>(&rhsTail->ty);
-        if (lf && rf)
-            return lf->index == rf->index;
-    }
-
-    {
-        const Unifiable::Bound<TypePackId>* lb = get_if<Unifiable::Bound<TypePackId>>(&lhsTail->ty);
-        const Unifiable::Bound<TypePackId>* rb = get_if<Unifiable::Bound<TypePackId>>(&rhsTail->ty);
-        if (lb && rb)
-            return areEqual(seen, *lb->boundTo, *rb->boundTo);
-    }
-
-    {
-        const GenericTypePack* lg = get_if<GenericTypePack>(&lhsTail->ty);
-        const GenericTypePack* rg = get_if<GenericTypePack>(&rhsTail->ty);
-        if (lg && rg)
-            return lg->index == rg->index;
-    }
-
-    {
-        const VariadicTypePack* lv = get_if<VariadicTypePack>(&lhsTail->ty);
-        const VariadicTypePack* rv = get_if<VariadicTypePack>(&rhsTail->ty);
-        if (lv && rv)
-            return areEqual(seen, *lv->ty, *rv->ty);
-    }
-
-    return false;
+    return follow(tp);
 }
 
 TypePackId follow(TypePackId tp)
@@ -476,6 +463,29 @@ LUAU_NOINLINE Unifiable::Bound<TypePackId>* emplaceTypePack<BoundTypePack>(TypeP
 {
     LUAU_ASSERT(ty != follow(tyArg));
     return &ty->ty.emplace<BoundTypePack>(tyArg);
+}
+
+TypePackId sliceTypePack(
+    const size_t sliceIndex,
+    const TypePackId toBeSliced,
+    const std::vector<TypeId>& head,
+    const std::optional<TypePackId> tail,
+    const NotNull<BuiltinTypes> builtinTypes,
+    const NotNull<TypeArena> arena
+)
+{
+    if (sliceIndex == 0)
+        return toBeSliced;
+    else if (sliceIndex == head.size())
+        return tail.value_or(builtinTypes->emptyTypePack);
+    else
+    {
+        auto superHeadIter = begin(head);
+        for (size_t i = 0; i < sliceIndex; ++i)
+            ++superHeadIter;
+        std::vector<TypeId> headSlice(std::move(superHeadIter), end(head));
+        return arena->addTypePack(std::move(headSlice), tail);
+    }
 }
 
 } // namespace Luau

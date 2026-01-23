@@ -1,9 +1,8 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
-#include "Luau/CodeGen.h"
 #include "Luau/BytecodeAnalysis.h"
-#include "Luau/BytecodeUtils.h"
 #include "Luau/BytecodeSummary.h"
 #include "Luau/IrDump.h"
+#include "Luau/IrUtils.h"
 
 #include "CodeGenLower.h"
 
@@ -12,7 +11,7 @@
 
 #include "lapi.h"
 
-LUAU_FASTFLAG(LuauNativeAttribute)
+LUAU_FASTFLAG(LuauCodegenLocationEndFix)
 
 namespace Luau
 {
@@ -138,7 +137,7 @@ unsigned getInstructionCount(const Instruction* insns, const unsigned size)
     for (unsigned i = 0; i < size;)
     {
         ++count;
-        i += Luau::getOpLength(LuauOpcode(LUAU_INSN_OP(insns[i])));
+        i += getOpLength(LuauOpcode(LUAU_INSN_OP(insns[i])));
     }
     return count;
 }
@@ -155,10 +154,7 @@ static std::string getAssemblyImpl(AssemblyBuilder& build, const TValue* func, A
     }
 
     std::vector<Proto*> protos;
-    if (FFlag::LuauNativeAttribute)
-        gatherFunctions(protos, root, options.compilationOptions.flags, root->flags & LPF_NATIVE_FUNCTION);
-    else
-        gatherFunctions_DEPRECATED(protos, root, options.compilationOptions.flags);
+    gatherFunctions(protos, root, options.compilationOptions.flags, root->flags & LPF_NATIVE_FUNCTION);
 
     protos.erase(
         std::remove_if(
@@ -232,7 +228,7 @@ static std::string getAssemblyImpl(AssemblyBuilder& build, const TValue* func, A
             functionStat.line = p->linedefined;
             functionStat.bcodeCount = getInstructionCount(p->code, p->sizecode);
             functionStat.irCount = unsigned(ir.function.instructions.size());
-            functionStat.asmSize = asmSize;
+            functionStat.asmSize = FFlag::LuauCodegenLocationEndFix ? asmSize * sizeof(build.code[0]) : asmSize;
             functionStat.asmCount = asmCount;
             if (stats->functionStatsFlags & FunctionStats_BytecodeSummary)
             {
@@ -258,6 +254,8 @@ static std::string getAssemblyImpl(AssemblyBuilder& build, const TValue* func, A
 
 #if defined(CODEGEN_TARGET_A64)
 unsigned int getCpuFeaturesA64();
+#else
+unsigned int getCpuFeaturesX64();
 #endif
 
 std::string getAssembly(lua_State* L, int idx, AssemblyOptions options, LoweringStats* stats)
@@ -273,7 +271,8 @@ std::string getAssembly(lua_State* L, int idx, AssemblyOptions options, Lowering
         static unsigned int cpuFeatures = getCpuFeaturesA64();
         A64::AssemblyBuilderA64 build(/* logText= */ options.includeAssembly, cpuFeatures);
 #else
-        X64::AssemblyBuilderX64 build(/* logText= */ options.includeAssembly);
+        static unsigned int cpuFeatures = getCpuFeaturesX64();
+        X64::AssemblyBuilderX64 build(/* logText= */ options.includeAssembly, cpuFeatures);
 #endif
 
         return getAssemblyImpl(build, func, options, stats);

@@ -4,7 +4,9 @@
 #include "Fixture.h"
 
 #include "Luau/Ast.h"
+#include "Luau/BuiltinDefinitions.h"
 #include "Luau/Common.h"
+#include "Luau/Error.h"
 #include "Luau/IostreamHelpers.h"
 #include "Luau/ModuleResolver.h"
 #include "Luau/VisitType.h"
@@ -12,6 +14,14 @@
 #include "ScopedFlags.h"
 #include "doctest.h"
 #include <iostream>
+
+LUAU_DYNAMIC_FASTINT(LuauConstraintGeneratorRecursionLimit)
+
+LUAU_FASTINT(LuauNonStrictTypeCheckerRecursionLimit)
+LUAU_FASTINT(LuauCheckRecursionLimit)
+LUAU_FASTFLAG(LuauAddRecursionCounterToNonStrictTypeChecker)
+LUAU_FASTFLAG(LuauExplicitTypeInstantiationSyntax)
+LUAU_FASTFLAG(LuauExplicitTypeInstantiationSupport)
 
 using namespace Luau;
 
@@ -58,11 +68,7 @@ using namespace Luau;
 struct NonStrictTypeCheckerFixture : Fixture
 {
 
-    NonStrictTypeCheckerFixture()
-    {
-        registerHiddenTypes(&frontend);
-        registerTestTypes();
-    }
+    NonStrictTypeCheckerFixture() = default;
 
     CheckResult checkNonStrict(const std::string& code)
     {
@@ -81,7 +87,18 @@ struct NonStrictTypeCheckerFixture : Fixture
         };
         LoadDefinitionFileResult res = loadDefinition(definitions);
         LUAU_ASSERT(res.success);
-        return frontend.check(moduleName);
+        return getFrontend().check(moduleName);
+    }
+
+    Frontend& getFrontend() override
+    {
+        if (frontend)
+            return *frontend;
+
+        Frontend& f = Fixture::getFrontend();
+        registerHiddenTypes(f);
+        registerTestTypes();
+        return *frontend;
     }
 
     std::string definitions = R"BUILTIN_SRC(
@@ -116,6 +133,7 @@ declare os : {
 }
 
 @checked declare function require(target : any) : any
+@checked declare function getAllTheArgsWrong(one: string, two: number, three: boolean) : any
 )BUILTIN_SRC";
 };
 
@@ -183,12 +201,13 @@ local x
 abs(lower(x))
 )");
 
-    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    LUAU_REQUIRE_ERROR_COUNT(2, result);
     NONSTRICT_REQUIRE_CHECKED_ERR(Position(2, 4), "abs", result);
+    NONSTRICT_REQUIRE_CHECKED_ERR(Position(2, 10), "lower", result);
 }
 
 
-TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "if_then_else_warns_with_never_local")
+TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "if_then_else_does_not_warn_with_never_local")
 {
     CheckResult result = checkNonStrict(R"(
 local x : never
@@ -199,9 +218,7 @@ else
 end
 )");
 
-    LUAU_REQUIRE_ERROR_COUNT(2, result);
-    NONSTRICT_REQUIRE_CHECKED_ERR(Position(3, 8), "abs", result);
-    NONSTRICT_REQUIRE_CHECKED_ERR(Position(5, 10), "lower", result);
+    LUAU_REQUIRE_NO_ERRORS(result);
 }
 
 TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "if_then_else_warns_nil_branches")
@@ -244,7 +261,8 @@ if cond() then
 end
 )");
 
-    LUAU_REQUIRE_NO_ERRORS(result);
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    NONSTRICT_REQUIRE_CHECKED_ERR(Position(3, 8), "abs", result);
 }
 
 TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "if_then_no_else_err_in_cond")
@@ -262,12 +280,22 @@ end
 TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "if_then_else_expr_should_warn")
 {
     CheckResult result = checkNonStrict(R"(
+local x = 42
+local y = if cond() then abs(x) else lower(x)
+)");
+
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    NONSTRICT_REQUIRE_CHECKED_ERR(Position(2, 43), "lower", result);
+}
+
+TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "if_then_else_expr_should_not_warn_for_never")
+{
+    CheckResult result = checkNonStrict(R"(
 local x : never
 local y = if cond() then abs(x) else lower(x)
 )");
-    LUAU_REQUIRE_ERROR_COUNT(2, result);
-    NONSTRICT_REQUIRE_CHECKED_ERR(Position(2, 29), "abs", result);
-    NONSTRICT_REQUIRE_CHECKED_ERR(Position(2, 43), "lower", result);
+
+    LUAU_REQUIRE_NO_ERRORS(result);
 }
 
 TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "if_then_else_expr_doesnt_warn_else_branch")
@@ -348,10 +376,22 @@ function f(x)
     lower(x)
 end
 )");
-    LUAU_REQUIRE_ERROR_COUNT(3, result);
-    NONSTRICT_REQUIRE_CHECKED_ERR(Position(2, 8), "abs", result);
-    NONSTRICT_REQUIRE_CHECKED_ERR(Position(3, 10), "lower", result);
+
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
     NONSTRICT_REQUIRE_FUNC_DEFINITION_ERR(Position(1, 11), "x", result);
+}
+
+TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "function_def_sequencing_errors_2")
+{
+    CheckResult result = checkNonStrict(R"(
+local t = {function(x)
+    abs(x)
+    lower(x)
+end}
+)");
+
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    CHECK(toString(result.errors[0]) == "the argument 'x' is used in a way that will error at runtime");
 }
 
 TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "local_fn_produces_error")
@@ -380,7 +420,7 @@ local y = function() lower(x) end
 TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "function_def_if_warns_never")
 {
     CheckResult result = checkNonStrict(R"(
-function f(x)
+function f(x: never)
     if cond() then
         abs(x)
     else
@@ -388,9 +428,8 @@ function f(x)
     end
 end
 )");
-    LUAU_REQUIRE_ERROR_COUNT(2, result);
-    NONSTRICT_REQUIRE_CHECKED_ERR(Position(3, 12), "abs", result);
-    NONSTRICT_REQUIRE_CHECKED_ERR(Position(5, 14), "lower", result);
+
+    LUAU_REQUIRE_NO_ERRORS(result);
 }
 
 TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "function_def_if_no_else")
@@ -419,6 +458,25 @@ end
 )");
     LUAU_REQUIRE_ERROR_COUNT(1, result);
     NONSTRICT_REQUIRE_CHECKED_ERR(Position(7, 10), "lower", result);
+}
+
+TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "generic_type_instantiation")
+{
+    ScopedFastFlag syntax{FFlag::LuauExplicitTypeInstantiationSyntax, true};
+    ScopedFastFlag semantics{FFlag::LuauExplicitTypeInstantiationSupport, true};
+
+    CheckResult result = checkNonStrict(R"(
+        function array<T>(): {T}
+            return {}
+        end
+
+        local foo = array<<number>>()
+        local bar = array<<string>>()
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
+    CHECK_EQ("{number}", toString(requireType("foo")));
+    CHECK_EQ("{string}", toString(requireType("bar")));
 }
 
 TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "function_def_if_assignment_no_errors")
@@ -486,6 +544,36 @@ foo.bar("hi")
     NONSTRICT_REQUIRE_CHECKED_ERR(Position(1, 8), "foo.bar", result);
 }
 
+TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "exprgroup_is_checked")
+{
+    CheckResult result = checkNonStrict(R"(
+        local foo = (abs("foo"))
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+
+    auto r1 = get<CheckedFunctionCallError>(result.errors[0]);
+    LUAU_ASSERT(r1);
+    CHECK_EQ("abs", r1->checkedFunctionName);
+    CHECK_EQ("number", toString(r1->expected));
+    CHECK_EQ("string", toString(r1->passed));
+}
+
+TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "binop_is_checked")
+{
+    CheckResult result = checkNonStrict(R"(
+        local foo = 4 + abs("foo")
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+
+    auto r1 = get<CheckedFunctionCallError>(result.errors[0]);
+    LUAU_ASSERT(r1);
+    CHECK_EQ("abs", r1->checkedFunctionName);
+    CHECK_EQ("number", toString(r1->expected));
+    CHECK_EQ("string", toString(r1->passed));
+}
+
 TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "incorrect_arg_count")
 {
     CheckResult result = checkNonStrict(R"(
@@ -508,6 +596,16 @@ optionalArgsAtTheEnd1("a")
 optionalArgsAtTheEnd1("a", 3)
 optionalArgsAtTheEnd1("a", nil, 3)
 )");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
+}
+
+TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "generic_type_packs_in_non_strict")
+{
+    CheckResult result = checkNonStrict(R"(
+        --!nonstrict
+        local test: <T...>(T...) -> () -- TypeError: Unknown type 'T'
+    )");
 
     LUAU_REQUIRE_NO_ERRORS(result);
 }
@@ -575,5 +673,229 @@ buffer.readi8(b, 0)
 )");
     LUAU_REQUIRE_NO_ERRORS(result);
 }
+
+TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "nonstrict_method_calls")
+{
+    Luau::unfreeze(getFrontend().globals.globalTypes);
+    Luau::unfreeze(getFrontend().globalsForAutocomplete.globalTypes);
+
+    registerBuiltinGlobals(getFrontend(), getFrontend().globals);
+    registerTestTypes();
+
+    Luau::freeze(getFrontend().globals.globalTypes);
+    Luau::freeze(getFrontend().globalsForAutocomplete.globalTypes);
+
+    CheckResult result = checkNonStrict(R"(
+        local test = "test"
+        test:lower()
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
+}
+
+TEST_CASE_FIXTURE(Fixture, "unknown_globals_in_non_strict_1")
+{
+    CheckResult result = check(Mode::Nonstrict, R"(
+        foo = 5
+        local wrong1 = foob
+
+        local x = 12
+        local wrong2 = x + foblm
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(2, result);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "unknown_types_in_non_strict")
+{
+    CheckResult result = check(Mode::Nonstrict, R"(
+        --!nonstrict
+        local foo: Foo = 1
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    const UnknownSymbol* err = get<UnknownSymbol>(result.errors[0]);
+    CHECK_EQ(err->name, "Foo");
+    CHECK_EQ(err->context, UnknownSymbol::Context::Type);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "unknown_types_in_non_strict_2")
+{
+    CheckResult result = check(Mode::Nonstrict, R"(
+        --!nonstrict
+        local foo = 1 :: Foo
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    const UnknownSymbol* err = get<UnknownSymbol>(result.errors[0]);
+    CHECK_EQ(err->name, "Foo");
+    CHECK_EQ(err->context, UnknownSymbol::Context::Type);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "buffer_is_not_unknown")
+{
+    CheckResult result = check(Mode::Nonstrict, R"(
+local function wrap(b: buffer, i: number, v: number)
+    buffer.writeu32(b, i * 4, v)
+end
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
+}
+
+TEST_CASE_FIXTURE(Fixture, "incomplete_function_annotation")
+{
+    CheckResult result = check(Mode::Nonstrict, R"(
+        local x: () ->
+    )");
+
+    LUAU_REQUIRE_ERRORS(result);
+}
+
+TEST_CASE_FIXTURE(Fixture, "unknown_globals_in_function_calls")
+{
+    CheckResult result = check(Mode::Nonstrict, R"(
+        local function foo() : ()
+            bar()
+        end
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    const UnknownSymbol* err = get<UnknownSymbol>(result.errors[0]);
+    CHECK_EQ(err->name, "bar");
+    CHECK_EQ(err->context, UnknownSymbol::Context::Binding);
+}
+
+TEST_CASE_FIXTURE(Fixture, "unknown_globals_in_one_sided_conditionals")
+{
+    CheckResult result = check(Mode::Nonstrict, R"(
+        local function foo(cond) : ()
+            if cond then
+                bar()
+            end
+        end
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    const UnknownSymbol* err = get<UnknownSymbol>(result.errors[0]);
+    CHECK_EQ(err->name, "bar");
+    CHECK_EQ(err->context, UnknownSymbol::Context::Binding);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "new_non_strict_should_suppress_dynamic_require_errors")
+{
+    ScopedFastFlag sff{FFlag::LuauSolverV2, true};
+    // Avoid warning about dynamic requires in new nonstrict mode
+    CheckResult result = check(Mode::Nonstrict, R"(
+function passThrough(module)
+    require(module)
+end
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(0, result);
+    // We should still warn about dynamic requires in strict mode
+    result = check(Mode::Strict, R"(
+function passThrough(module)
+    require(module)
+end
+)");
+
+    LUAU_REQUIRE_ERROR_COUNT(1, result);
+    const UnknownRequire* req = get<UnknownRequire>(result.errors[0]);
+    CHECK(req != nullptr);
+}
+
+TEST_CASE_FIXTURE(BuiltinsFixture, "new_non_strict_should_suppress_unknown_require_errors")
+{
+    ScopedFastFlag sff{FFlag::LuauSolverV2, true};
+
+    // Avoid warning about dynamic requires in new nonstrict mode
+    CheckResult result = check(Mode::Nonstrict, R"(
+require(script.NonExistent)
+require("@self/NonExistent")
+    )");
+
+    LUAU_REQUIRE_ERROR_COUNT(0, result);
+    // We should still warn about dynamic requires in strict mode
+    result = check(Mode::Strict, R"(
+require(script.NonExistent)
+require("@self/NonExistent")
+)");
+
+    LUAU_REQUIRE_ERROR_COUNT(2, result);
+    const UnknownRequire* req1 = get<UnknownRequire>(result.errors[0]);
+    CHECK(req1 != nullptr);
+    const UnknownRequire* req2 = get<UnknownRequire>(result.errors[1]);
+    CHECK(req2 != nullptr);
+}
+
+TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "new_non_strict_stringifies_checked_function_errors_as_one_indexed")
+{
+    CheckResult result = checkNonStrict(R"(
+getAllTheArgsWrong(3, true, "what")
+)");
+    LUAU_REQUIRE_ERROR_COUNT(3, result);
+    const CheckedFunctionCallError* err1 = get<CheckedFunctionCallError>(result.errors[0]);
+    const CheckedFunctionCallError* err2 = get<CheckedFunctionCallError>(result.errors[1]);
+    const CheckedFunctionCallError* err3 = get<CheckedFunctionCallError>(result.errors[2]);
+    CHECK(err1 != nullptr);
+    CHECK(err2 != nullptr);
+    CHECK(err3 != nullptr);
+    CHECK_EQ(
+        "the function 'getAllTheArgsWrong' expects to get a string as its 1st argument, but is being given a number", toString(result.errors[0])
+    );
+    CHECK_EQ(
+        "the function 'getAllTheArgsWrong' expects to get a number as its 2nd argument, but is being given a boolean", toString(result.errors[1])
+    );
+    CHECK_EQ(
+        "the function 'getAllTheArgsWrong' expects to get a boolean as its 3rd argument, but is being given a string", toString(result.errors[2])
+    );
+}
+
+TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "new_non_strict_skips_warnings_on_unreduced_typefunctions")
+{
+    CheckResult result = checkNonStrict(R"(
+function foo(x)
+    local y = x + 1
+    return abs(y)
+end
+)");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
+}
+
+TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "nonstrict_check_block_recursion_limit")
+{
+    int limit = 250;
+
+    ScopedFastFlag sff{FFlag::LuauAddRecursionCounterToNonStrictTypeChecker, true};
+
+    ScopedFastInt luauNonStrictTypeCheckerRecursionLimit{FInt::LuauNonStrictTypeCheckerRecursionLimit, limit - 100};
+    ScopedFastInt luauConstraintGeneratorRecursionLimit{DFInt::LuauConstraintGeneratorRecursionLimit, limit + 500};
+    ScopedFastInt luauCheckRecursionLimit{FInt::LuauCheckRecursionLimit, limit + 500};
+
+    CheckResult result = checkNonStrict(rep("do ", limit) + "local a = 1" + rep(" end", limit));
+
+    // Nonstrict recursion limit just exits early and doesn't produce an error
+    LUAU_REQUIRE_NO_ERRORS(result);
+}
+
+#if 0 // CLI-181303 requires a ConstraintGenerator::checkPack fix to succeed in debug on Windows
+TEST_CASE_FIXTURE(NonStrictTypeCheckerFixture, "nonstrict_check_expr_recursion_limit")
+{
+    int limit = 250;
+
+    ScopedFastFlag sff{FFlag::LuauAddRecursionCounterToNonStrictTypeChecker, true};
+
+    ScopedFastInt luauNonStrictTypeCheckerRecursionLimit{FInt::LuauNonStrictTypeCheckerRecursionLimit, limit - 100};
+    ScopedFastInt luauConstraintGeneratorRecursionLimit{DFInt::LuauConstraintGeneratorRecursionLimit, limit + 500};
+    ScopedFastInt luauCheckRecursionLimit{FInt::LuauCheckRecursionLimit, limit + 500};
+
+    CheckResult result = checkNonStrict(R"(("foo"))" + rep(":lower()", limit));
+
+    // Nonstrict recursion limit just exits early and doesn't produce an error
+    LUAU_REQUIRE_NO_ERRORS(result);
+}
+#endif
 
 TEST_SUITE_END();

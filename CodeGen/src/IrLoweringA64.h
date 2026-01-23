@@ -38,12 +38,16 @@ struct IrLoweringA64
     Label& getTargetLabel(IrOp op, Label& fresh);
     void finalizeTargetLabel(IrOp op, Label& fresh);
 
+    void checkSafeEnv(IrOp target, const IrBlock& next);
+    void checkObjectBarrierConditions(RegisterA64 object, RegisterA64 temp, RegisterA64 ra, IrOp raOp, int ratag, Label& skip);
+
     // Operand data build helpers
     // May emit data/address synthesis instructions
     RegisterA64 tempDouble(IrOp op);
+    RegisterA64 tempFloat(IrOp op);
     RegisterA64 tempInt(IrOp op);
     RegisterA64 tempUint(IrOp op);
-    AddressA64 tempAddr(IrOp op, int offset);
+    AddressA64 tempAddr(IrOp op, int offset, RegisterA64 tempStorage = noreg); // Existing temporary register can be provided
     AddressA64 tempAddrBuffer(IrOp bufferOp, IrOp indexOp, uint8_t tag);
 
     // May emit restore instructions
@@ -54,6 +58,7 @@ struct IrLoweringA64
     uint8_t tagOp(IrOp op) const;
     int intOp(IrOp op) const;
     unsigned uintOp(IrOp op) const;
+    unsigned importOp(IrOp op) const;
     double doubleOp(IrOp op) const;
 
     IrBlock& blockOp(IrOp op) const;

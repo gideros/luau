@@ -477,7 +477,7 @@ init: // using goto's to optimize tail recursion
                 {
                     p += 4;
                     goto init; // return match(ms, s, p + 4);
-                }              // else fail (s == NULL)
+                } // else fail (s == NULL)
                 break;
             }
             case 'f':
@@ -555,7 +555,7 @@ init: // using goto's to optimize tail recursion
                 case '+':             // 1 or more repetitions
                     s++;              // 1 match already done
                     LUAU_FALLTHROUGH; // go through
-                case '*': // 0 or more repetitions
+                case '*':             // 0 or more repetitions
                     s = max_expand(ms, s, p, ep);
                     break;
                 case '-': // 0 or more repetitions (minimum)
@@ -999,8 +999,9 @@ static int str_format(lua_State* L)
             {
             case 'c':
             {
-                snprintf(buff, sizeof(buff), form, (int)luaL_checknumber(L, arg));
-                break;
+                int count = snprintf(buff, sizeof(buff), form, (int)luaL_checknumber(L, arg));
+                luaL_addlstring(&b, buff, count);
+                continue; // skip the 'luaL_addlstring' at the end
             }
             case 'd':
             case 'i':
@@ -1323,7 +1324,7 @@ static KOption getoption(Header* h, const char** fmt, int* size)
 ** Read, classify, and fill other details about the next option.
 ** 'psize' is filled with option's size, 'notoalign' with its
 ** alignment requirements.
-** Local variable 'size' gets the size to be aligned. (Kpadal option
+** Local variable 'size' gets the size to be aligned. (Kpaddalign option
 ** always gets its full alignment, other options are limited by
 ** the maximum alignment ('maxalign'). Kchar option needs no alignment
 ** despite its size.

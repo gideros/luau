@@ -3,6 +3,7 @@
 
 #include "Luau/NotNull.h"
 #include "Luau/Substitution.h"
+#include "Luau/Subtyping.h"
 #include "Luau/TxnLog.h"
 #include "Luau/TypeFwd.h"
 #include "Luau/Unifiable.h"
@@ -53,17 +54,36 @@ struct Replacer : Substitution
 };
 
 // A substitution which replaces generic functions by monomorphic functions
-struct Instantiation2 : Substitution
+struct Instantiation2 final : Substitution
 {
     // Mapping from generic types to free types to be used in instantiation.
     DenseHashMap<TypeId, TypeId> genericSubstitutions{nullptr};
     // Mapping from generic type packs to `TypePack`s of free types to be used in instantiation.
     DenseHashMap<TypePackId, TypePackId> genericPackSubstitutions{nullptr};
 
+    // Make `NotNull` with LuauInstantiationUsesGenericPolarity
+    Subtyping* subtyping = nullptr;
+    Scope* scope = nullptr;
+
     Instantiation2(TypeArena* arena, DenseHashMap<TypeId, TypeId> genericSubstitutions, DenseHashMap<TypePackId, TypePackId> genericPackSubstitutions)
         : Substitution(TxnLog::empty(), arena)
         , genericSubstitutions(std::move(genericSubstitutions))
         , genericPackSubstitutions(std::move(genericPackSubstitutions))
+    {
+    }
+
+    Instantiation2(
+        TypeArena* arena,
+        DenseHashMap<TypeId, TypeId> genericSubstitutions,
+        DenseHashMap<TypePackId, TypePackId> genericPackSubstitutions,
+        NotNull<Subtyping> subtyping,
+        NotNull<Scope> scope
+    )
+        : Substitution(TxnLog::empty(), arena)
+        , genericSubstitutions(std::move(genericSubstitutions))
+        , genericPackSubstitutions(std::move(genericPackSubstitutions))
+        , subtyping(subtyping)
+        , scope(scope)
     {
     }
 
@@ -74,16 +94,37 @@ struct Instantiation2 : Substitution
     TypePackId clean(TypePackId tp) override;
 };
 
-std::optional<TypeId> instantiate2(
+// Clip with LuauInstantiationUsesGenericPolarity
+std::optional<TypeId> instantiate2_DEPRECATED(
     TypeArena* arena,
     DenseHashMap<TypeId, TypeId> genericSubstitutions,
     DenseHashMap<TypePackId, TypePackId> genericPackSubstitutions,
     TypeId ty
 );
+
+// Clip with LuauInstantiationUsesGenericPolarity
+std::optional<TypePackId> instantiate2_DEPRECATED(
+    TypeArena* arena,
+    DenseHashMap<TypeId, TypeId> genericSubstitutions,
+    DenseHashMap<TypePackId, TypePackId> genericPackSubstitutions,
+    TypePackId tp
+);
+
+std::optional<TypeId> instantiate2(
+    TypeArena* arena,
+    DenseHashMap<TypeId, TypeId> genericSubstitutions,
+    DenseHashMap<TypePackId, TypePackId> genericPackSubstitutions,
+    NotNull<Subtyping> subtyping,
+    NotNull<Scope> scope,
+    TypeId ty
+);
+
 std::optional<TypePackId> instantiate2(
     TypeArena* arena,
     DenseHashMap<TypeId, TypeId> genericSubstitutions,
     DenseHashMap<TypePackId, TypePackId> genericPackSubstitutions,
+    NotNull<Subtyping> subtyping,
+    NotNull<Scope> scope,
     TypePackId tp
 );
 

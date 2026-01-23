@@ -2,10 +2,13 @@
 #include "ConstantFolding.h"
 
 #include "BuiltinFolding.h"
+#include "Luau/Lexer.h"
 
 #include <vector>
 #include <math.h>
 #define BINOP(v) ((uint32_t)(((int64_t)(v))&0xFFFFFFFF))
+
+LUAU_FASTFLAG(LuauExplicitTypeInstantiationSyntax)
 
 namespace Luau
 {
@@ -58,6 +61,14 @@ static void foldUnary(Constant& result, AstExprUnary::Op op, const Constant& arg
             result.type = Constant::Type_Number;
             result.valueNumber = -arg.valueNumber;
         }
+        else if (arg.type == Constant::Type_Vector)
+        {
+            result.type = Constant::Type_Vector;
+            result.valueVector[0] = -arg.valueVector[0];
+            result.valueVector[1] = -arg.valueVector[1];
+            result.valueVector[2] = -arg.valueVector[2];
+            result.valueVector[3] = -arg.valueVector[3];
+        }
         break;
 
     case AstExprUnary::Len:
@@ -82,7 +93,7 @@ static void foldUnary(Constant& result, AstExprUnary::Op op, const Constant& arg
     }
 }
 
-static void foldBinary(Constant& result, AstExprBinary::Op op, const Constant& la, const Constant& ra)
+static void foldBinary(Constant& result, AstExprBinary::Op op, const Constant& la, const Constant& ra, AstNameTable& stringTable)
 {
     switch (op)
     {
@@ -92,6 +103,14 @@ static void foldBinary(Constant& result, AstExprBinary::Op op, const Constant& l
             result.type = Constant::Type_Number;
             result.valueNumber = la.valueNumber + ra.valueNumber;
         }
+        else if (la.type == Constant::Type_Vector && ra.type == Constant::Type_Vector)
+        {
+            result.type = Constant::Type_Vector;
+            result.valueVector[0] = la.valueVector[0] + ra.valueVector[0];
+            result.valueVector[1] = la.valueVector[1] + ra.valueVector[1];
+            result.valueVector[2] = la.valueVector[2] + ra.valueVector[2];
+            result.valueVector[3] = la.valueVector[3] + ra.valueVector[3];
+        }
         break;
 
     case AstExprBinary::Sub:
@@ -99,6 +118,14 @@ static void foldBinary(Constant& result, AstExprBinary::Op op, const Constant& l
         {
             result.type = Constant::Type_Number;
             result.valueNumber = la.valueNumber - ra.valueNumber;
+        }
+        else if (la.type == Constant::Type_Vector && ra.type == Constant::Type_Vector)
+        {
+            result.type = Constant::Type_Vector;
+            result.valueVector[0] = la.valueVector[0] - ra.valueVector[0];
+            result.valueVector[1] = la.valueVector[1] - ra.valueVector[1];
+            result.valueVector[2] = la.valueVector[2] - ra.valueVector[2];
+            result.valueVector[3] = la.valueVector[3] - ra.valueVector[3];
         }
         break;
 
@@ -108,6 +135,48 @@ static void foldBinary(Constant& result, AstExprBinary::Op op, const Constant& l
             result.type = Constant::Type_Number;
             result.valueNumber = la.valueNumber * ra.valueNumber;
         }
+        else if (la.type == Constant::Type_Vector && ra.type == Constant::Type_Vector)
+        {
+            bool hadW = la.valueVector[3] != 0.0f || ra.valueVector[3] != 0.0f;
+            float resultW = la.valueVector[3] * ra.valueVector[3];
+
+            if (resultW == 0.0f || hadW)
+            {
+                result.type = Constant::Type_Vector;
+                result.valueVector[0] = la.valueVector[0] * ra.valueVector[0];
+                result.valueVector[1] = la.valueVector[1] * ra.valueVector[1];
+                result.valueVector[2] = la.valueVector[2] * ra.valueVector[2];
+                result.valueVector[3] = resultW;
+            }
+        }
+        else if (la.type == Constant::Type_Number && ra.type == Constant::Type_Vector)
+        {
+            bool hadW = ra.valueVector[3] != 0.0f;
+            float resultW = float(la.valueNumber) * ra.valueVector[3];
+
+            if (resultW == 0.0f || hadW)
+            {
+                result.type = Constant::Type_Vector;
+                result.valueVector[0] = float(la.valueNumber) * ra.valueVector[0];
+                result.valueVector[1] = float(la.valueNumber) * ra.valueVector[1];
+                result.valueVector[2] = float(la.valueNumber) * ra.valueVector[2];
+                result.valueVector[3] = resultW;
+            }
+        }
+        else if (la.type == Constant::Type_Vector && ra.type == Constant::Type_Number)
+        {
+            bool hadW = la.valueVector[3] != 0.0f;
+            float resultW = la.valueVector[3] * float(ra.valueNumber);
+
+            if (resultW == 0.0f || hadW)
+            {
+                result.type = Constant::Type_Vector;
+                result.valueVector[0] = la.valueVector[0] * float(ra.valueNumber);
+                result.valueVector[1] = la.valueVector[1] * float(ra.valueNumber);
+                result.valueVector[2] = la.valueVector[2] * float(ra.valueNumber);
+                result.valueVector[3] = resultW;
+            }
+        }
         break;
 
     case AstExprBinary::Div:
@@ -116,6 +185,48 @@ static void foldBinary(Constant& result, AstExprBinary::Op op, const Constant& l
             result.type = Constant::Type_Number;
             result.valueNumber = la.valueNumber / ra.valueNumber;
         }
+        else if (la.type == Constant::Type_Vector && ra.type == Constant::Type_Vector)
+        {
+            bool hadW = la.valueVector[3] != 0.0f || ra.valueVector[3] != 0.0f;
+            float resultW = la.valueVector[3] / ra.valueVector[3];
+
+            if (resultW == 0.0f || hadW)
+            {
+                result.type = Constant::Type_Vector;
+                result.valueVector[0] = la.valueVector[0] / ra.valueVector[0];
+                result.valueVector[1] = la.valueVector[1] / ra.valueVector[1];
+                result.valueVector[2] = la.valueVector[2] / ra.valueVector[2];
+                result.valueVector[3] = resultW;
+            }
+        }
+        else if (la.type == Constant::Type_Number && ra.type == Constant::Type_Vector)
+        {
+            bool hadW = ra.valueVector[3] != 0.0f;
+            float resultW = float(la.valueNumber) / ra.valueVector[3];
+
+            if (resultW == 0.0f || hadW)
+            {
+                result.type = Constant::Type_Vector;
+                result.valueVector[0] = float(la.valueNumber) / ra.valueVector[0];
+                result.valueVector[1] = float(la.valueNumber) / ra.valueVector[1];
+                result.valueVector[2] = float(la.valueNumber) / ra.valueVector[2];
+                result.valueVector[3] = resultW;
+            }
+        }
+        else if (la.type == Constant::Type_Vector && ra.type == Constant::Type_Number)
+        {
+            bool hadW = la.valueVector[3] != 0.0f;
+            float resultW = la.valueVector[3] / float(ra.valueNumber);
+
+            if (resultW == 0.0f || hadW)
+            {
+                result.type = Constant::Type_Vector;
+                result.valueVector[0] = la.valueVector[0] / float(ra.valueNumber);
+                result.valueVector[1] = la.valueVector[1] / float(ra.valueNumber);
+                result.valueVector[2] = la.valueVector[2] / float(ra.valueNumber);
+                result.valueVector[3] = resultW;
+            }
+        }
         break;
 
     case AstExprBinary::FloorDiv:
@@ -123,6 +234,48 @@ static void foldBinary(Constant& result, AstExprBinary::Op op, const Constant& l
         {
             result.type = Constant::Type_Number;
             result.valueNumber = trunc(la.valueNumber / ra.valueNumber);
+        }
+        else if (la.type == Constant::Type_Vector && ra.type == Constant::Type_Vector)
+        {
+            bool hadW = la.valueVector[3] != 0.0f || ra.valueVector[3] != 0.0f;
+            float resultW = floor(la.valueVector[3] / ra.valueVector[3]);
+
+            if (resultW == 0.0f || hadW)
+            {
+                result.type = Constant::Type_Vector;
+                result.valueVector[0] = floor(la.valueVector[0] / ra.valueVector[0]);
+                result.valueVector[1] = floor(la.valueVector[1] / ra.valueVector[1]);
+                result.valueVector[2] = floor(la.valueVector[2] / ra.valueVector[2]);
+                result.valueVector[3] = resultW;
+            }
+        }
+        else if (la.type == Constant::Type_Number && ra.type == Constant::Type_Vector)
+        {
+            bool hadW = ra.valueVector[3] != 0.0f;
+            float resultW = floor(float(la.valueNumber) / ra.valueVector[3]);
+
+            if (resultW == 0.0f || hadW)
+            {
+                result.type = Constant::Type_Vector;
+                result.valueVector[0] = floor(float(la.valueNumber) / ra.valueVector[0]);
+                result.valueVector[1] = floor(float(la.valueNumber) / ra.valueVector[1]);
+                result.valueVector[2] = floor(float(la.valueNumber) / ra.valueVector[2]);
+                result.valueVector[3] = resultW;
+            }
+        }
+        else if (la.type == Constant::Type_Vector && ra.type == Constant::Type_Number)
+        {
+            bool hadW = la.valueVector[3] != 0.0f;
+            float resultW = floor(la.valueVector[3] / float(ra.valueNumber));
+
+            if (resultW == 0.0f || hadW)
+            {
+                result.type = Constant::Type_Vector;
+                result.valueVector[0] = floor(la.valueVector[0] / float(ra.valueNumber));
+                result.valueVector[1] = floor(la.valueVector[1] / float(ra.valueNumber));
+                result.valueVector[2] = floor(la.valueVector[2] / float(ra.valueNumber));
+                result.valueVector[3] = floor(la.valueVector[3] / float(ra.valueNumber));
+            }
         }
         break;
 
@@ -143,6 +296,24 @@ static void foldBinary(Constant& result, AstExprBinary::Op op, const Constant& l
         break;
 
     case AstExprBinary::Concat:
+        if (la.type == Constant::Type_String && ra.type == Constant::Type_String)
+        {
+            result.type = Constant::Type_String;
+            result.stringLength = la.stringLength + ra.stringLength;
+            if (la.stringLength == 0)
+                result.valueString = ra.valueString;
+            else if (ra.stringLength == 0)
+                result.valueString = la.valueString;
+            else
+            {
+                std::string tmp;
+                tmp.reserve(result.stringLength + 1);
+                tmp.append(la.valueString, la.stringLength);
+                tmp.append(ra.valueString, ra.stringLength);
+                AstName name = stringTable.getOrAdd(tmp.c_str(), result.stringLength);
+                result.valueString = name.value;
+            }
+        }
         break;
 
     case AstExprBinary::CompareNe:
@@ -269,6 +440,48 @@ static void foldBinary(Constant& result, AstExprBinary::Op op, const Constant& l
     }
 }
 
+static void foldInterpString(Constant& result, AstExprInterpString* expr, DenseHashMap<AstExpr*, Constant>& constants, AstNameTable& stringTable)
+{
+    LUAU_ASSERT(expr->strings.size == expr->expressions.size + 1);
+    size_t resultLength = 0;
+    for (size_t index = 0; index < expr->strings.size; ++index)
+    {
+        resultLength += expr->strings.data[index].size;
+        if (index < expr->expressions.size)
+        {
+            const Constant* c = constants.find(expr->expressions.data[index]);
+            LUAU_ASSERT(c != nullptr && c->type == Constant::Type::Type_String);
+            resultLength += c->stringLength;
+        }
+    }
+    result.type = Constant::Type_String;
+    result.stringLength = resultLength;
+
+    if (resultLength == 0)
+    {
+        result.valueString = "";
+        return;
+    }
+
+    std::string tmp;
+    tmp.reserve(resultLength);
+
+    for (size_t index = 0; index < expr->strings.size; ++index)
+    {
+        AstArray<char> string = expr->strings.data[index];
+        tmp.append(string.data, string.size);
+        if (index < expr->expressions.size)
+        {
+            const Constant* c = constants.find(expr->expressions.data[index]);
+            tmp.append(c->valueString, c->stringLength);
+        }
+    }
+    result.type = Constant::Type_String;
+    result.stringLength = resultLength;
+    AstName name = stringTable.getOrAdd(tmp.c_str(), resultLength);
+    result.valueString = name.value;
+}
+
 struct ConstantVisitor : AstVisitor
 {
     DenseHashMap<AstExpr*, Constant>& constants;
@@ -276,7 +489,9 @@ struct ConstantVisitor : AstVisitor
     DenseHashMap<AstLocal*, Constant>& locals;
 
     const DenseHashMap<AstExprCall*, int>* builtins;
-    bool foldMathK = false;
+    bool foldLibraryK = false;
+    LibraryMemberConstantCallback libraryMemberConstantCb;
+    AstNameTable& stringTable;
 
     bool wasEmpty = false;
 
@@ -287,13 +502,17 @@ struct ConstantVisitor : AstVisitor
         DenseHashMap<AstLocal*, Variable>& variables,
         DenseHashMap<AstLocal*, Constant>& locals,
         const DenseHashMap<AstExprCall*, int>* builtins,
-        bool foldMathK
+        bool foldLibraryK,
+        LibraryMemberConstantCallback libraryMemberConstantCb,
+        AstNameTable& stringTable
     )
         : constants(constants)
         , variables(variables)
         , locals(locals)
         , builtins(builtins)
-        , foldMathK(foldMathK)
+        , foldLibraryK(foldLibraryK)
+        , libraryMemberConstantCb(libraryMemberConstantCb)
+        , stringTable(stringTable)
     {
         // since we do a single pass over the tree, if the initial state was empty we don't need to clear out old entries
         wasEmpty = constants.empty() && locals.empty();
@@ -368,7 +587,7 @@ struct ConstantVisitor : AstVisitor
                 if (canFold)
                 {
                     LUAU_ASSERT(builtinArgs.size() == offset + expr->args.size);
-                    result = foldBuiltin(*bfid, builtinArgs.data() + offset, expr->args.size);
+                    result = foldBuiltin(stringTable, *bfid, builtinArgs.data() + offset, expr->args.size);
                 }
 
                 builtinArgs.resize(offset);
@@ -383,11 +602,16 @@ struct ConstantVisitor : AstVisitor
         {
             analyze(expr->expr);
 
-            if (foldMathK)
+            if (foldLibraryK)
             {
-                if (AstExprGlobal* eg = expr->expr->as<AstExprGlobal>(); eg && eg->name == "math")
+                if (AstExprGlobal* eg = expr->expr->as<AstExprGlobal>())
                 {
-                    result = foldBuiltinMath(expr->index);
+                    if (eg->name == "math")
+                        result = foldBuiltinMath(expr->index);
+
+                    // if we have a custom handler and the constant hasn't been resolved
+                    if (libraryMemberConstantCb && result.type == Constant::Type_Unknown)
+                        libraryMemberConstantCb(eg->name.value, expr->index.value, reinterpret_cast<Luau::CompileConstant*>(&result));
                 }
             }
         }
@@ -427,7 +651,7 @@ struct ConstantVisitor : AstVisitor
 
             // note: ra doesn't need to be constant to fold and/or
             if (la.type != Constant::Type_Unknown)
-                foldBinary(result, expr->op, la, ra);
+                foldBinary(result, expr->op, la, ra, stringTable);
         }
         else if (AstExprTypeAssertion* expr = node->as<AstExprTypeAssertion>())
         {
@@ -446,8 +670,18 @@ struct ConstantVisitor : AstVisitor
         }
         else if (AstExprInterpString* expr = node->as<AstExprInterpString>())
         {
+            bool onlyConstantSubExpr = true;
             for (AstExpr* expression : expr->expressions)
-                analyze(expression);
+                if (analyze(expression).type != Constant::Type_String)
+                    onlyConstantSubExpr = false;
+
+            if (onlyConstantSubExpr)
+                foldInterpString(result, expr, constants, stringTable);
+        }
+        else if (AstExprInstantiate* expr = node->as<AstExprInstantiate>())
+        {
+            LUAU_ASSERT(FFlag::LuauExplicitTypeInstantiationSyntax);
+            result = analyze(expr->expr);
         }
         else
         {
@@ -535,11 +769,13 @@ void foldConstants(
     DenseHashMap<AstLocal*, Variable>& variables,
     DenseHashMap<AstLocal*, Constant>& locals,
     const DenseHashMap<AstExprCall*, int>* builtins,
-    bool foldMathK,
-    AstNode* root
+    bool foldLibraryK,
+    LibraryMemberConstantCallback libraryMemberConstantCb,
+    AstNode* root,
+    AstNameTable& stringTable
 )
 {
-    ConstantVisitor visitor{constants, variables, locals, builtins, foldMathK};
+    ConstantVisitor visitor{constants, variables, locals, builtins, foldLibraryK, libraryMemberConstantCb, stringTable};
     root->visit(&visitor);
 }
 

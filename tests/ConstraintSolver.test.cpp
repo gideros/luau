@@ -61,4 +61,29 @@ TEST_CASE_FIXTURE(ConstraintGeneratorFixture, "proper_let_generalization")
     CHECK("(unknown) -> number" == toString(idType));
 }
 
+TEST_CASE_FIXTURE(ConstraintGeneratorFixture, "table_prop_access_diamond")
+{
+    CheckResult result = check(R"(
+        export type ItemDetails = { Id: number }
+
+        export type AssetDetails = ItemDetails & {}
+        export type BundleDetails = ItemDetails & {}
+
+        export type CatalogPage = { AssetDetails | BundleDetails }
+
+        local function isRestricted(item: number) end
+
+        -- Clear all item tiles and create new ones for the items in the specified page
+        local function displayPage(catalogPage: CatalogPage)
+            for _, itemDetails in catalogPage do
+                if isRestricted(itemDetails.Id) then
+                    continue
+                end
+            end
+        end
+    )");
+
+    LUAU_REQUIRE_NO_ERRORS(result);
+}
+
 TEST_SUITE_END();
