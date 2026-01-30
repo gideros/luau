@@ -716,6 +716,15 @@ struct Printer
             case AstExprUnary::Len:
                 writer.symbol("#");
                 break;
+            case AstExprUnary::AngToDeg:
+                writer.symbol("^>");
+                break;
+            case AstExprUnary::AngToRad:
+                writer.symbol("^<");
+                break;
+            case AstExprUnary::BinNot:
+                writer.symbol("~");
+                break;
             }
             visualize(*a->expr);
         }
@@ -1504,6 +1513,9 @@ struct Printer
             break;
         case AstAttr::Deprecated:
             writer.keyword("@deprecated");
+            break;
+        case AstAttr::Shader:
+            writer.keyword("@shader");
             break;
         case AstAttr::Unknown:
             writer.keyword("@" + std::string{attribute.name.value});

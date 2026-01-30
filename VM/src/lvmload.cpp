@@ -35,6 +35,14 @@ struct TempBuffer {
 			luaM_freearray(L, data, count, T, 0);
 	}
 
+    void clear() {
+        if (data)
+            luaM_freearray(L, data, count, T, 0);
+        data=NULL;
+        L=NULL;
+        count=0;
+    }
+
 	void allocate(lua_State *L, size_t count) {
 		LUAU_ASSERT(this->L == nullptr);
 		this->L = L;
@@ -238,7 +246,9 @@ static int loadsafe(lua_State *L, TempBuffer<TString*> &strings,
 	lua_newtable(L);
 	while (offset < size) {
 
-		uint8_t version = read<uint8_t>(data, size, offset);
+        strings.clear();
+        protos.clear();
+        uint8_t version = read<uint8_t>(data, size, offset);
 
 		// 0 means the rest of the bytecode is the error message
 		if (version == 0) {

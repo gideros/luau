@@ -2704,6 +2704,21 @@ void IrLoweringA64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
     case IrCmd::RETURN:
         regs.spill(index);
 
+        {
+			/** Gideros call profiler hook if set
+				if (L->profilerHook)
+					L->profilerHook(L,0); **/
+			Label skipProfiler;
+
+			build.ldr(x4, mem(rState, offsetof(lua_State, profilerHook)));
+			build.cbz(x4, skipProfiler);
+			build.mov(x0, rState);
+			build.mov(x1, 0);
+			build.blr(x4);
+			build.setLabel(skipProfiler);
+		/** End Gideros */
+        }
+
         if (function.variadic)
         {
             build.ldr(x1, mem(rState, offsetof(lua_State, ci)));

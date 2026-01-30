@@ -1215,10 +1215,7 @@ reentry:
                 CallInfo* cip = ci - 1;
 
                 if (L->profilerHook)
-                    if (!LUAU_UNLIKELY((cip->flags & LUA_CALLINFO_NATIVE)))
-                    {
-                        L->profilerHook(L,0);
-                    }
+                    L->profilerHook(L,0);
 
                 StkId res = ci->func; // note: we assume CALL always puts func+args and expects results to start at func
 

@@ -24,8 +24,8 @@ LOCAL_SRC_FILES += $(addsuffix .cpp, \
         $(addprefix ../Ast/src/,Allocator Ast Confusables Cst Lexer Location Parser PrettyPrinter))
 
 #CodeGen not yet support for android
-#LOCAL_CFLAGS += -DLUAU_ENABLE_CODEGEN
-#LOCAL_SRC_FILES += $(addsuffix .cpp, \
+LOCAL_CFLAGS += -DLUAU_ENABLE_CODEGEN
+LOCAL_SRC_FILES += $(addsuffix .cpp, \
         $(addprefix ../CodeGen/src/,BytecodeAnalysis BytecodeSummary CodeAllocator CodeBlockUnwind CodeGen CodeGenAssembly CodeGenContext CodeGenUtils \
          IrAnalysis IrBuilder IrCallWrapperX64 IrDump IrTranslateBuiltins IrTranslation IrUtils IrValueLocationTracking \
          lcodegen NativeProtoExecData NativeState OptimizeConstProp OptimizeDeadStore SharedCodeAllocator \

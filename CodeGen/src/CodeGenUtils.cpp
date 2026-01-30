@@ -188,6 +188,9 @@ Closure* callProlog(lua_State* L, TValue* ra, StkId argtop, int nresults)
     L->base = ci->base;
     L->top = argtop;
 
+    if (L->profilerHook)
+        L->profilerHook(L,1);
+
     // note: this reallocs stack, but we don't need to VM_PROTECT this
     // this is because we're going to modify base/savedpc manually anyhow
     // crucially, we can't use ra/argtop after this line
@@ -266,6 +269,9 @@ Closure* callFallback(lua_State* L, StkId ra, StkId argtop, int nresults)
     L->base = ci->base;
     L->top = argtop;
 
+    if (L->profilerHook)
+       L->profilerHook(L,1);
+
     // note: this reallocs stack, but we don't need to VM_PROTECT this
     // this is because we're going to modify base/savedpc manually anyhow
     // crucially, we can't use ra/argtop after this line
@@ -300,6 +306,9 @@ Closure* callFallback(lua_State* L, StkId ra, StkId argtop, int nresults)
         // yield
         if (n < 0)
             return (Closure*)CALL_FALLBACK_YIELD;
+
+        if (L->profilerHook)
+           L->profilerHook(L,0);
 
         // ci is our callinfo, cip is our parent
         CallInfo* ci = L->ci;

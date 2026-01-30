@@ -117,10 +117,27 @@ void emitInstCall(AssemblyBuilderX64& build, ModuleHelpers& helpers, int ra, int
         // results = ccl->c.f(L);
         build.mov(rArg1, rState);
         build.call(qword[ccl + offsetof(Closure, c.f)]); // Last use of 'ccl'
-        RegisterX64 results = eax;
+        RegisterX64 results = ebx;
+        build.mov(results, eax);
 
         build.test(results, results);                            // test here will set SF=1 for a negative number and it always sets OF to 0
         build.jcc(ConditionX64::Less, helpers.exitNoContinueVm); // jl jumps if SF != OF
+
+        /** Gideros call profiler hook if set
+            if (L->profilerHook)
+                L->profilerHook(L,0); **/
+        Label skipProfiler;
+        RegisterX64 pHook = rax;
+
+        build.mov(pHook, qword[rState + offsetof(lua_State, profilerHook)]);
+        build.test(pHook,pHook);
+        build.jcc(ConditionX64::Zero, skipProfiler);
+        build.mov(rArg1, rState);
+        build.xor_(rArg2,rArg2);
+        build.call(pHook);
+        build.setLabel(skipProfiler);
+        /** End Gideros */
+
 
         // We have special handling for small number of expected results below
         if (nresults != 0 && nresults != 1)
@@ -176,6 +193,28 @@ void emitInstReturn(AssemblyBuilderX64& build, ModuleHelpers& helpers, int ra, i
 {
     RegisterX64 res = rdi;
     RegisterX64 written = ecx;
+
+    RegisterX64 rArg1 = (build.abi == ABIX64::Windows) ? rcx : rdi;
+    RegisterX64 rArg2 = (build.abi == ABIX64::Windows) ? rdx : rsi;
+
+    /** Gideros call profiler hook if set
+        if (L->profilerHook)
+            L->profilerHook(L,0); **/
+    Label skipProfiler;
+    RegisterX64 pHook = rax;
+
+    build.mov(pHook, qword[rState + offsetof(lua_State, profilerHook)]);
+    build.test(pHook,pHook);
+    build.jcc(ConditionX64::Zero, skipProfiler);
+    build.push(rdi);
+    build.push(rcx);
+    build.mov(rArg1, rState);
+    build.xor_(rArg2,rArg2);
+    build.call(pHook);
+    build.pop(rcx);
+    build.pop(rdi);
+    build.setLabel(skipProfiler);
+/** End Gideros */
 
     if (functionVariadic)
     {
